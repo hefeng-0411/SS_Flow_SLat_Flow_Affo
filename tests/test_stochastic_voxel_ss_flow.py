@@ -31,6 +31,7 @@ from scripts.train_stochastic_voxel_ss_flow import (
     TrainableVoxelSSBranch,
     append_metrics,
 )
+from scripts.cache_affostruction_depth import _canonical_support_pixels
 
 
 def _make_meshfleet_object(root: Path, views: int = 10, missing: tuple[int, ...] = ()) -> None:
@@ -122,6 +123,72 @@ def test_dataset_gapped_render_ids_keep_image_camera_and_metadata_aligned(tmp_pa
     batch = stochastic_meshfleet_collate([sample])
     assert torch.equal(batch["view_ids"][0], sample["view_ids"])
     assert torch.equal(batch["view_metadata_indices"][0], sample["view_metadata_indices"])
+
+
+def test_depth_quality_manifest_preserves_exact_gapped_frame_alignment(tmp_path: Path):
+    _make_meshfleet_object(tmp_path, views=10, missing=(1, 4))
+    depth_dir = tmp_path / "depth" / "train" / "unit_object"
+    depth_dir.mkdir(parents=True)
+    valid_ids = ["002", "007", "009"]
+    for frame_id in valid_ids:
+        value = np.float32(int(frame_id) + 1)
+        np.savez_compressed(
+            depth_dir / f"{frame_id}.npz",
+            depth_u16=np.ones((16, 16), dtype=np.uint16),
+            depth_min=value,
+            depth_max=value,
+        )
+    (depth_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "quality_protocol": "per_frame_rgb_depth_camera_intersection_v2",
+                "status": "complete",
+                "declared_frames": 8,
+                "valid_frames": 3,
+                "rejected_frames": 5,
+                "valid_frame_ids": valid_ids,
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = StochasticMeshFleetDataset(
+        str(tmp_path),
+        min_views=3,
+        max_views=3,
+        seed=17,
+        use_stochastic_views=False,
+        image_size=16,
+        load_gt_occupancy=False,
+        depth_root=str(tmp_path / "depth"),
+        require_depth=True,
+    )
+    sample = dataset[0]
+
+    assert set(sample["view_ids"].tolist()) == {2, 7, 9}
+    assert sample["metadata"]["depth_frame_ids"] == sample["metadata"]["selected_frame_ids"]
+    assert sample["metadata"]["missing_frame_ids"] == ["001", "004"]
+    assert sample["metadata"]["num_frames_available"] == 8
+    assert sample["metadata"]["num_frames_verified"] == 3
+    assert sample["metadata"]["quality_rejected_frames"] == 5
+    for position, view_id in enumerate(sample["view_ids"].tolist()):
+        assert torch.allclose(
+            sample["depths"][position],
+            torch.full((16, 16), float(view_id + 1)),
+        )
+        assert Path(sample["metadata"]["selected_frame_paths"][position]).stem == f"{view_id:03d}"
+
+
+def test_depth_quality_requires_support_in_trellis_canonical_volume():
+    depth = torch.full((1, 2, 2), 0.25)
+    intrinsic = torch.tensor(
+        [[[100.0, 0.0, 0.5], [0.0, 100.0, 0.5], [0.0, 0.0, 1.0]]]
+    )
+    canonical_camera = torch.eye(4).unsqueeze(0)
+    displaced_camera = canonical_camera.clone()
+    displaced_camera[:, 0, 3] = 2.0
+
+    assert _canonical_support_pixels(depth, intrinsic, canonical_camera).tolist() == [4]
+    assert _canonical_support_pixels(depth, intrinsic, displaced_camera).tolist() == [0]
 
 
 def test_alignment_reports_rays_that_no_scale_can_place_in_canonical_box():

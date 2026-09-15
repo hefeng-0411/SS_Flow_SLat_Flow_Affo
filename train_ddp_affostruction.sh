@@ -78,7 +78,8 @@ run_slat() {
 }
 
 cache_depth() {
-  for SPLIT_NAME in train test; do
+  read -r -a DEPTH_SPLIT_NAMES <<< "${DEPTH_SPLITS:-train test}"
+  for SPLIT_NAME in "${DEPTH_SPLIT_NAMES[@]}"; do
     "$TORCHRUN_BIN" --standalone --nproc_per_node="$PROCESS_COUNT" \
       scripts/cache_affostruction_depth.py \
       --data-root "${DATASET_ROOT}" \
@@ -86,7 +87,13 @@ cache_depth() {
       --split "${SPLIT_NAME}" \
       --render-set renders \
       --image-size 224 \
-      --minimum-mask-iou 0.90
+      --minimum-mask-iou "${DEPTH_MINIMUM_MASK_IOU:-0.90}" \
+      --raster-batch-size "${DEPTH_RASTER_BATCH_SIZE:-16}" \
+      --minimum-foreground-fraction "${DEPTH_MINIMUM_FOREGROUND_FRACTION:-0.002}" \
+      --maximum-foreground-fraction "${DEPTH_MAXIMUM_FOREGROUND_FRACTION:-0.95}" \
+      --minimum-valid-frames "${DEPTH_MINIMUM_VALID_FRAMES:-1}" \
+      --minimum-canonical-pixels "${DEPTH_MINIMUM_CANONICAL_PIXELS:-64}" \
+      "$@"
   done
 }
 
@@ -98,7 +105,7 @@ case "$STAGE" in
     run_slat "$@"
     ;;
   cache_depth)
-    cache_depth
+    cache_depth "$@"
     ;;
   all)
     if [[ $# -ne 0 ]]; then

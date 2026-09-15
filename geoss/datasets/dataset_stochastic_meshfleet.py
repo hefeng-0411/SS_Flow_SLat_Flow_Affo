@@ -78,6 +78,8 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         )
         if meshfleet_root is not None:
             self._apply_meshfleet_manifest(Path(meshfleet_root))
+        if self.require_depth:
+            self._apply_depth_quality_manifests()
         if not self.samples:
             raise RuntimeError(f"MeshFleet split {split!r} contains no usable objects under {root}")
 
@@ -96,6 +98,57 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         manifest = build_uid_manifest(discover_artifact_schema(split_path))
         by_uid = {sample["uid"]: sample for sample in self.samples}
         self.samples = [by_uid[entry.uid] for entry in manifest.entries if entry.uid in by_uid]
+
+    def _apply_depth_quality_manifests(self) -> None:
+        """Keep every object that has at least one verified RGB/depth/camera tuple."""
+        retained = []
+        for sample in self.samples:
+            render_dir = sample["render_dir"]
+            transforms = json.loads((render_dir / "transforms.json").read_text(encoding="utf-8"))
+            available = _available_render_frame_records(render_dir, transforms.get("frames", []))
+            verified, quality = self._verified_depth_records(sample["uid"], available)
+            if verified:
+                enriched = dict(sample)
+                enriched["depth_quality"] = quality
+                retained.append(enriched)
+            else:
+                self.discovery_skips.append(
+                    {
+                        "uid": sample["uid"],
+                        "reason": "no verified RGB/depth/camera frame in depth-quality manifest",
+                    }
+                )
+        self.samples = retained
+
+    def _verified_depth_records(self, uid, available):
+        destination = self.depth_root / self.split / uid
+        manifest_path = destination / "manifest.json"
+        quality = {
+            "protocol": "legacy_depth_file_intersection",
+            "manifest": str(manifest_path),
+        }
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            frame_ids = manifest.get("valid_frame_ids", manifest.get("frame_ids", []))
+            valid_ids = {str(frame_id) for frame_id in frame_ids}
+            quality = {
+                "protocol": manifest.get("quality_protocol", "legacy_object_mean_iou"),
+                "manifest": str(manifest_path),
+                "status": manifest.get("status", "complete"),
+                "declared_frames": int(manifest.get("declared_frames", len(available))),
+                "valid_frames": int(manifest.get("valid_frames", len(valid_ids))),
+                "rejected_frames": int(manifest.get("rejected_frames", 0)),
+            }
+        else:
+            valid_ids = {record.frame_id for record in available}
+        verified = [
+            record
+            for record in available
+            if record.frame_id in valid_ids
+            and (destination / f"{record.frame_id}.npz").is_file()
+        ]
+        quality["available_verified_frames"] = len(verified)
+        return verified, quality
 
     def set_epoch(self, epoch: int) -> None:
         self._shared_epoch.value = int(epoch)
@@ -118,9 +171,15 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         transform_path = render_dir / "transforms.json"
         transforms = json.loads(transform_path.read_text(encoding="utf-8"))
         frames = transforms.get("frames", [])
-        available = _available_render_frame_records(render_dir, frames)
+        joined_available = _available_render_frame_records(render_dir, frames)
+        available = joined_available
+        depth_quality = None
+        if self.depth_root is not None:
+            available, depth_quality = self._verified_depth_records(sample["uid"], available)
         if not available:
-            raise RuntimeError(f"Empty valid view set in {transform_path}")
+            raise RuntimeError(
+                f"Empty verified RGB/depth/camera view set in {transform_path}"
+            )
 
         generator = torch.Generator(device="cpu")
         generator.manual_seed(self._sample_seed(index, sample["uid"]))
@@ -219,10 +278,13 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
                 "selected_frame_paths": [str(record.image_path) for record in chosen],
                 "selected_frame_ids": [record.frame_id for record in chosen],
                 "selected_frame_metadata_indices": [record.metadata_index for record in chosen],
-                "missing_frame_ids": _missing_declared_frame_ids(frames, available),
+                "missing_frame_ids": _missing_declared_frame_ids(frames, joined_available),
                 "num_frames_total": len(frames),
-                "num_frames_available": len(available),
-                "missing_frames_skipped": len(frames) - len(available),
+                "num_frames_available": len(joined_available),
+                "num_frames_verified": len(available),
+                "missing_frames_skipped": len(frames) - len(joined_available),
+                "quality_rejected_frames": len(joined_available) - len(available),
+                "depth_quality": depth_quality,
                 "epoch": self.epoch,
                 "rank": self.rank,
             },
