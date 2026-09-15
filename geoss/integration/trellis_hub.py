@@ -1,9 +1,93 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import torch
+
+
+def resolve_local_hf_snapshot(
+    model_or_path: str,
+    cache_root: str | os.PathLike[str],
+    *,
+    required_file: str,
+    validate_trellis_pipeline: bool = False,
+) -> str:
+    """Resolve a complete local Hugging Face snapshot without network access."""
+
+    explicit = Path(model_or_path).expanduser()
+    candidates: list[Path] = []
+    if explicit.is_dir():
+        candidates.append(explicit)
+    elif "/" in model_or_path:
+        repository = (
+            Path(cache_root).expanduser()
+            / f"models--{model_or_path.replace('/', '--')}"
+        )
+        ref = repository / "refs" / "main"
+        if ref.is_file():
+            revision = ref.read_text(encoding="utf-8").strip()
+            if revision:
+                candidates.append(repository / "snapshots" / revision)
+        snapshots = repository / "snapshots"
+        if snapshots.is_dir():
+            candidates.extend(
+                sorted(
+                    (path for path in snapshots.iterdir() if path.is_dir()),
+                    key=lambda path: path.stat().st_mtime_ns,
+                    reverse=True,
+                )
+            )
+        # Some pre-existing downloads use a repository-root materialization.
+        candidates.append(repository)
+    else:
+        raise FileNotFoundError(
+            f"Expected a local model directory or Hugging Face repo id, got {model_or_path!r}"
+        )
+
+    seen: set[str] = set()
+    failures: list[str] = []
+    for candidate in candidates:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        required = candidate / required_file
+        if not required.is_file():
+            failures.append(f"{candidate}: missing {required_file}")
+            continue
+        if validate_trellis_pipeline:
+            try:
+                _validate_local_trellis_pipeline(candidate)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                failures.append(f"{candidate}: {exc}")
+                continue
+        return str(candidate.resolve())
+
+    detail = "; ".join(failures) if failures else "no local candidates"
+    raise FileNotFoundError(
+        f"No complete local snapshot for {model_or_path!r} under "
+        f"{Path(cache_root).expanduser()}: {detail}. Production training does not download implicitly."
+    )
+
+
+def _validate_local_trellis_pipeline(snapshot: Path) -> None:
+    """Verify that every model referenced by pipeline.json is materialized."""
+
+    pipeline_file = snapshot / "pipeline.json"
+    payload = json.loads(pipeline_file.read_text(encoding="utf-8"))
+    models = payload["args"]["models"]
+    if not isinstance(models, dict) or not models:
+        raise ValueError("pipeline.json has no model mapping")
+    for name, relative in models.items():
+        prefix = snapshot / str(relative)
+        config = prefix.with_suffix(".json")
+        weights = prefix.with_suffix(".safetensors")
+        if not config.is_file() or not weights.is_file():
+            raise FileNotFoundError(
+                f"incomplete model {name!r}: expected {config.name} and {weights.name}"
+            )
 
 
 def configure_trellis_hub(args) -> dict[str, str | None]:

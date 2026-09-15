@@ -1,18 +1,45 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from types import MethodType
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
 
-from geoss.integration.trellis_ss_hook import GeoSSTrellisSSWrapper, ss_grid_to_tokens, tokens_to_ss_grid
+from geoss.integration.trellis_ss_hook import (
+    DirectConditionedTrellisSSWrapper,
+    GeoSSTrellisSSWrapper,
+    ss_grid_to_tokens,
+    tokens_to_ss_grid,
+)
 from geoss.io.asset_io import write_internal_mesh
 from geoss.metrics.gaussian_metrics import gaussian_statistics
-from geoss.slat.integration.trellis_slat_hook import GeoVisTrellisSLATWrapper
+from geoss.slat.integration.trellis_slat_hook import (
+    DirectConditionedTrellisSLATWrapper,
+    GeoVisTrellisSLATWrapper,
+)
+
+
+def _stage_autocast(device: torch.device, dtype: Optional[torch.dtype]):
+    if dtype is None or device.type != "cuda":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def _atomic_asset_write(path: Path, writer: Callable[[Path], object]) -> None:
+    """Publish a generated asset only after its complete payload reaches disk."""
+    temporary = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        writer(temporary)
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise OSError(f"Asset writer produced an empty file: {temporary}")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class RealTrellisGeoPipeline:
@@ -63,6 +90,28 @@ class RealTrellisGeoPipeline:
             use_geovis_slat=True,
         ).to(self.device)
 
+    def install_direct_ss_flow(self, flow_model) -> None:
+        """Install a full-backbone Affostruction SS flow for native sampling."""
+        self.pipeline.models["sparse_structure_flow_model"] = (
+            DirectConditionedTrellisSSWrapper(flow_model).to(self.device).eval()
+        )
+
+    def install_direct_slat_flow(
+        self,
+        correction_flow,
+        *,
+        residual_limit: float = 1.0,
+    ) -> None:
+        """Install a sparse image-flow correction around frozen native SLat."""
+        native_flow = self.pipeline.models["slat_flow_model"]
+        self.pipeline.models["slat_flow_model"] = (
+            DirectConditionedTrellisSLATWrapper(
+                native_flow,
+                correction_flow,
+                residual_limit=residual_limit,
+            ).to(self.device).eval()
+        )
+
     def ss_velocity_hook(self, x_t: torch.Tensor, t: torch.Tensor, cond, base_velocity: torch.Tensor, context: Dict[str, torch.Tensor]):
         flow = self.pipeline.models["sparse_structure_flow_model"]
         if not isinstance(flow, GeoSSTrellisSSWrapper):
@@ -95,6 +144,9 @@ class RealTrellisGeoPipeline:
         crop_padding: float = 1.2,
         geoss_context: Optional[Dict[str, torch.Tensor]] = None,
         geovis_slat_context: Optional[Dict[str, torch.Tensor]] = None,
+        geovis_slat_context_factory: Optional[
+            Callable[[torch.Tensor], Dict[str, torch.Tensor]]
+        ] = None,
         coords_override: Optional[torch.Tensor] = None,
         formats: Iterable[str] = ("gaussian", "mesh"),
         seed: int = 42,
@@ -102,6 +154,8 @@ class RealTrellisGeoPipeline:
         slat_sampler_params: Optional[dict] = None,
         multi_image_mode: str = "multidiffusion",
         preprocess_images: bool = True,
+        ss_autocast_dtype: Optional[torch.dtype] = None,
+        slat_autocast_dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, object]:
         images = self._prepare_conditioning_images(
             images,
@@ -129,19 +183,26 @@ class RealTrellisGeoPipeline:
                 mode=multi_image_mode,
                 context_key="geoss_context",
             ) if num_images > 1 or geoss_context is not None else contextlib.nullcontext()
-            with ss_context:
+            with ss_context, _stage_autocast(self.device, ss_autocast_dtype):
                 ss_latent_grid, coords = self.sample_sparse_structure_latent(
                     cond,
                     geoss_context=geoss_context,
                     sampler_params=ss_params,
                 )
+        if geovis_slat_context_factory is not None:
+            if geovis_slat_context is not None:
+                raise ValueError(
+                    "Pass either geovis_slat_context or geovis_slat_context_factory, not both"
+                )
+            with _stage_autocast(self.device, slat_autocast_dtype):
+                geovis_slat_context = geovis_slat_context_factory(coords)
         slat_context = _adapter_aware_sampler(
             self.pipeline.slat_sampler,
             num_images=num_images,
             mode=multi_image_mode,
             context_key="geovis_slat_context",
         ) if num_images > 1 or geovis_slat_context is not None else contextlib.nullcontext()
-        with slat_context:
+        with slat_context, _stage_autocast(self.device, slat_autocast_dtype):
             slat = self.sample_slat(cond, coords, geovis_slat_context=geovis_slat_context, sampler_params=slat_params)
         decoded = self.pipeline.decode_slat(slat, list(formats))
         decoded["coords"] = coords
@@ -422,7 +483,7 @@ class RealTrellisGeoPipeline:
         gaussian = outputs.get("gaussian")
         if isinstance(gaussian, list) and gaussian:
             path = output_dir / "asset_gaussian.ply"
-            gaussian[0].save_ply(str(path))
+            _atomic_asset_write(path, lambda temporary: gaussian[0].save_ply(str(temporary)))
             saved["gaussian_ply"] = str(path)
             saved["gaussian_statistics"] = gaussian_statistics(gaussian[0])
         mesh = outputs.get("mesh")
@@ -431,7 +492,10 @@ class RealTrellisGeoPipeline:
             # the decoder's internal canonical frame for CD/F-score; TRELLIS'
             # public GLB conversion rotates vertices into y-up exchange space.
             internal_path = output_dir / "asset_mesh_internal.ply"
-            write_internal_mesh(mesh[0], internal_path, real_mode=True)
+            _atomic_asset_write(
+                internal_path,
+                lambda temporary: write_internal_mesh(mesh[0], temporary, real_mode=True),
+            )
             saved["mesh_internal_ply"] = str(internal_path)
             path = output_dir / "asset_mesh.glb"
             if hasattr(mesh[0], "export"):
@@ -451,11 +515,16 @@ class RealTrellisGeoPipeline:
         coords = outputs.get("coords")
         if not isinstance(coords, torch.Tensor) or not isinstance(slat_feats, torch.Tensor):
             raise TypeError("TRELLIS sampler must return tensor coordinates and SLAT features for Stage-2 handoff.")
-        torch.save(
-            {"coords": coords.detach().cpu().contiguous(), "slat": slat_feats.detach().cpu().contiguous()},
-            output_dir / "trellis_latents.pt",
+        latent_path = output_dir / "trellis_latents.pt"
+        latent_payload = {
+            "coords": coords.detach().cpu().contiguous(),
+            "slat": slat_feats.detach().cpu().contiguous(),
+        }
+        _atomic_asset_write(
+            latent_path,
+            lambda temporary: torch.save(latent_payload, temporary),
         )
-        saved["latents"] = str(output_dir / "trellis_latents.pt")
+        saved["latents"] = str(latent_path)
         return saved
 
     def _require_models(self, *names: str) -> None:

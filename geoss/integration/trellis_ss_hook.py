@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from geoss.models.ss_velocity_adapter import SSVelocityAdapter
 from geoss.models.ss_flow_adapter import SSFlowAdapter
+from geoss.models.affostruction_conditioning import compact_condition_tokens
 
 
 def ss_grid_to_tokens(x: torch.Tensor) -> torch.Tensor:
@@ -164,6 +165,73 @@ def install_geometry_conditioned_ss_hook(
     adapter: SSFlowAdapter,
 ) -> GeometryConditionedTrellisSSWrapper:
     return GeometryConditionedTrellisSSWrapper(base_model, adapter)
+
+
+class DirectConditionedTrellisSSWrapper(nn.Module):
+    """Inference wrapper for a full-backbone Affostruction SS checkpoint."""
+
+    architecture_version = "affostruction_direct_ss_cross_attention_v1"
+
+    def __init__(self, flow_model: nn.Module) -> None:
+        super().__init__()
+        self.flow_model = flow_model
+        self.last_debug: Dict[str, Any] = {}
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError as original_error:
+            wrapped = self.__dict__.get("_modules", {}).get("flow_model")
+            if wrapped is not None and hasattr(wrapped, name):
+                return getattr(wrapped, name)
+            raise original_error
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        *,
+        geoss_context: Optional[Dict[str, torch.Tensor]] = None,
+        voxel_condition: Optional[torch.Tensor] = None,
+        observation_mask: Optional[torch.Tensor] = None,
+        adapter_enabled: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        if geoss_context is not None:
+            if voxel_condition is not None or observation_mask is not None:
+                raise ValueError(
+                    "Pass direct SS conditioning either as geoss_context or as explicit tensors, not both"
+                )
+            voxel_condition = geoss_context.get(
+                "voxel_condition", geoss_context.get("dense_tokens")
+            )
+            observation_mask = geoss_context.get("observation_mask")
+        if not adapter_enabled or voxel_condition is None:
+            return self.flow_model(x, t, cond, **kwargs)
+        if observation_mask is None:
+            raise ValueError("Direct SS conditioning requires observation_mask")
+        compact = compact_condition_tokens(voxel_condition, observation_mask)
+        if compact.tokens.shape[0] != 1:
+            raise RuntimeError("Direct SS inference requires one object per sampler call")
+        if int(compact.counts[0].item()) < 1:
+            output = self.flow_model(x, t, cond, **kwargs)
+            self.last_debug = {
+                "direct_voxel_condition": False,
+                "fallback": "native_image_condition",
+            }
+            return output
+        condition = compact.tokens[:, : int(compact.counts[0].item())]
+        output = self.flow_model(x, t, condition, **kwargs)
+        self.last_debug = {
+            "direct_voxel_condition": True,
+            "condition_tokens": int(condition.shape[1]),
+        }
+        return output
+
+
+def install_direct_conditioned_ss_hook(flow_model: nn.Module) -> DirectConditionedTrellisSSWrapper:
+    return DirectConditionedTrellisSSWrapper(flow_model)
 
 
 def _ss_grid_xyz(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

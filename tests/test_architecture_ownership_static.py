@@ -20,15 +20,19 @@ def test_main_pipeline_keeps_trellis_backbone_and_no_baseline_import():
     assert "splatfacto" not in src.lower()
 
 
-def test_real_training_paths_do_not_create_random_condition_or_zero_base():
+def test_real_training_paths_use_real_condition_and_decoupled_affostruction_flow():
     ss = _read("scripts/train_sparse_ray_ss_velocity.py")
     assert "cond = torch.randn" not in ss
     assert "torch.zeros_like(ss_latent_tokens)" not in ss
     assert "target_residual_tokens = ss_grid_to_tokens(target_v - v_base).detach()" in ss
     slat = _read("scripts/train_geovis_slat.py")
-    assert "trellis_slat_base_velocity" in slat
-    assert "real_train requires trellis_slat_base_velocity or a real TRELLIS pipeline" in slat
-    assert 'batch["target_residual"] = (batch["target_velocity"] - batch["v_slat_base"]).detach()' in slat
+    assert "compute_direct_slat_losses" in slat
+    assert "AffostructionSLatFlow" in slat
+    assert "build_affostruction_image_slat_denoiser" in slat
+    assert 'flow_backbone.eval().requires_grad_(False)' in slat
+    assert 'target = batch["target_velocity"].detach()' in slat
+    assert 'batch["target_residual"] = (batch["target_velocity"] - frozen_base).detach()' in slat
+    assert 'batch["v_slat_base"] = torch.zeros_like(x_t)' not in slat
 
 
 def test_sparse_adapter_refuses_missing_base_velocity_when_tokens_exist():

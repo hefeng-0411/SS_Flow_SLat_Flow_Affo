@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import itertools
 import json
 import math
 import os
@@ -32,60 +33,111 @@ from geoss.datasets.dataset_stochastic_meshfleet import (  # noqa: E402
     seed_meshfleet_worker,
     stochastic_meshfleet_collate,
 )
-from geoss.integration.trellis_hub import configure_trellis_hub  # noqa: E402
-from geoss.integration.trellis_ss_hook import ss_grid_to_tokens, tokens_to_ss_grid  # noqa: E402
+from geoss.integration.trellis_hub import (  # noqa: E402
+    configure_trellis_hub,
+    resolve_local_hf_snapshot,
+)
+from geoss.integration.trellis_ss_hook import ss_grid_to_tokens  # noqa: E402
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper  # noqa: E402
 from geoss.losses.geometric_loss import FlowMatchingLossBuilder  # noqa: E402
-from geoss.models.ss_flow_adapter import SSFlowAdapter  # noqa: E402
+from geoss.models.affostruction_conditioning import extract_dinov2_spatial_features  # noqa: E402
+from geoss.models.ss_flow_adapter import AffostructionSSFlow  # noqa: E402
 from geoss.models.voxel_fusion_engine import ConfidenceSparseVoxelFusion  # noqa: E402
 from geoss.ops.flow_matching import construct_flow_training_pair  # noqa: E402
 
 
-class TrainableVoxelSSBranch(nn.Module):
-    """The only DDP-replicated branch: voxel projection/refinement + adapter."""
+SS_OPTIMIZATION_NUMERICS_VERSION = "fp32_master_bf16_forward_v2"
 
-    def __init__(self, fusion: ConfidenceSparseVoxelFusion, adapter: SSFlowAdapter) -> None:
+
+class TrainableVoxelSSBranch(nn.Module):
+    """DDP branch containing voxel fusion and the complete trainable SS flow."""
+
+    def __init__(self, fusion: ConfidenceSparseVoxelFusion, flow: AffostructionSSFlow) -> None:
         super().__init__()
         self.fusion = fusion
-        self.adapter = adapter
+        self.flow = flow
 
     def forward(
         self,
         geometry,
         batch: Dict[str, torch.Tensor],
-        x_t_tokens: torch.Tensor,
+        x_t_grid: torch.Tensor,
         timestep_model: torch.Tensor,
-        v_base_tokens: torch.Tensor,
+        fallback_condition: torch.Tensor,
+        dino_spatial_features: torch.Tensor,
         *,
         profile: bool = False,
     ):
-        fusion_timer = CudaStageTimer(x_t_tokens.device, profile)
+        fusion_timer = CudaStageTimer(x_t_grid.device, profile)
         fusion_timer.start()
         fused = self.fusion(
             geometry,
             foreground_masks=batch["masks"],
+            dataset_K=batch.get("K_dataset"),
             dataset_c2w=batch["c2w_dataset"],
             canonical_center=batch["canonical_center"],
             canonical_half_extent=batch["canonical_half_extent"],
             profile=profile,
+            spatial_features=dino_spatial_features,
+        )
+        # Native TRELLIS receives the real DINO image condition when no ray
+        # intersects the canonical volume.  Keep the (necessarily inactive)
+        # fusion parameters in the same DDP graph so a rare fallback sample on
+        # one rank cannot desynchronize gradient collectives on other ranks.
+        fallback_condition = fallback_condition + parameter_graph_zero(
+            self.fusion, fallback_condition
         )
         fusion_ms = fusion_timer.stop()
-        adapter_timer = CudaStageTimer(x_t_tokens.device, profile)
-        adapter_timer.start()
-        adapted = self.adapter(
-            x_t_tokens,
-            fused.dense_tokens,
+        flow_timer = CudaStageTimer(x_t_grid.device, profile)
+        flow_timer.start()
+        prediction = self.flow(
+            x_t_grid,
             timestep_model,
+            fused.dense_tokens,
             fused.observation_mask,
-            fused.voxel_confidence,
-            v_base=v_base_tokens,
+            fallback_condition=fallback_condition,
         )
-        adapter_ms = adapter_timer.stop()
-        return fused, adapted, {
+        flow_ms = flow_timer.stop()
+        return fused, prediction, {
             "voxel_fusion": fusion_ms,
             **fused.timings_ms,
-            "adapter_forward": adapter_ms,
+            "ss_backbone_forward": flow_ms,
         }
+
+
+def parameter_graph_zero(module: nn.Module, reference: torch.Tensor) -> torch.Tensor:
+    """Return scalar zero whose autograd graph touches all trainable parameters."""
+    graph_zero = reference.new_zeros(())
+    for parameter in module.parameters():
+        if parameter.requires_grad and parameter.numel() > 0:
+            graph_zero = graph_zero + parameter.reshape(-1)[0] * 0.0
+    return graph_zero
+
+
+class ResumableDistributedSampler(DistributedSampler):
+    """DistributedSampler with an explicit rank-local cursor for exact resume."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    @property
+    def full_length(self) -> int:
+        return super().__len__()
+
+    def set_start_index(self, start_index: int) -> None:
+        start_index = int(start_index)
+        if not 0 <= start_index <= self.full_length:
+            raise ValueError(
+                f"Sampler cursor {start_index} lies outside [0,{self.full_length}]"
+            )
+        self.start_index = start_index
+
+    def __iter__(self):
+        return itertools.islice(super().__iter__(), self.start_index, None)
+
+    def __len__(self) -> int:
+        return max(self.full_length - self.start_index, 0)
 
 
 def main() -> None:
@@ -110,8 +162,10 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
             "VGGT has no padded-view attention mask; production stochastic 1-8 view training therefore requires --batch-size 1 per rank."
         )
     precision = resolve_precision(args.precision, device)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
     if rank == 0:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         print(json.dumps({"event": "startup", "world_size": world_size, "precision": str(precision), "args": vars(args)}))
 
     dataset = StochasticMeshFleetDataset(
@@ -128,7 +182,9 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
         meshfleet_root=args.meshfleet_root,
         require_ss_latents=True,
     )
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
+    sampler = ResumableDistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+    )
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -143,14 +199,15 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
     )
     if len(loader) == 0:
         raise RuntimeError("Distributed MeshFleet loader is empty")
+    full_batches_per_epoch = len(loader)
     validation_loader = build_validation_loader(args, rank, world_size, device)
 
     vggt, trellis_pipeline, base_flow, decoder = load_frozen_foundations(args, device)
     fusion = ConfidenceSparseVoxelFusion(
         grid_resolution=args.grid_resolution,
-        input_feature_dim=2048,
-        projected_feature_dim=args.voxel_feature_dim,
-        positional_frequencies=args.positional_frequencies,
+        input_feature_dim=1024,
+        projected_feature_dim=1024,
+        positional_frequencies=4,
         fusion_mode=args.fusion_mode,
         use_vggt_depth=args.use_vggt_depth,
         use_vggt_pointmap=args.use_vggt_pointmap,
@@ -159,24 +216,48 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
         use_3d_positional_encoding=args.use_3d_positional_encoding,
         require_spconv=True,
         use_spconv_refinement=args.use_spconv_refinement,
+        conditioning_layout="affostruction",
     ).to(device)
-    adapter = SSFlowAdapter(
-        latent_dim=8,
+    flow = AffostructionSSFlow(
+        base_flow,
         condition_dim=fusion.condition_dim,
-        hidden_dim=args.adapter_hidden_dim,
-        num_heads=args.adapter_heads,
-        num_blocks=args.adapter_blocks,
-        g_observed=args.g_observed,
-        g_unobserved=args.g_unobserved,
-        trust_region=args.trust_region,
+        classifier_free_dropout=args.classifier_free_dropout,
         gradient_checkpointing=args.gradient_checkpointing,
-        use_observation_gate=args.use_observation_gate,
     ).to(device)
-    trainable: nn.Module = TrainableVoxelSSBranch(fusion, adapter).to(device)
-    optimizer = torch.optim.AdamW(trainable.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.max_steps, 1), eta_min=args.min_learning_rate)
+    trainable: nn.Module = TrainableVoxelSSBranch(fusion, flow).to(
+        device=device, dtype=torch.float32
+    )
+    assert_fp32_finite_trainable_parameters(trainable, "SS initialization")
+    optimizer = torch.optim.AdamW(
+        trainable.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        eps=args.adam_epsilon,
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda update: warmup_cosine_factor(
+            update,
+            total_updates=args.max_steps,
+            warmup_updates=args.warmup_steps,
+            minimum_ratio=args.min_learning_rate / args.learning_rate,
+        ),
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == torch.float16)
-    start_step, epoch = maybe_resume(args.resume, trainable, optimizer, scheduler, scaler, device, rank)
+    start_step, epoch, batches_seen_in_epoch = maybe_resume(
+        args.resume,
+        trainable,
+        optimizer,
+        scheduler,
+        scaler,
+        device,
+        rank,
+        batches_per_epoch=full_batches_per_epoch,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
+    if batches_seen_in_epoch >= full_batches_per_epoch:
+        epoch += batches_seen_in_epoch // full_batches_per_epoch
+        batches_seen_in_epoch %= full_batches_per_epoch
     if world_size > 1:
         trainable = DDP(
             trainable,
@@ -191,11 +272,11 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
         lambda_silhouette=args.lambda_silhouette,
         lambda_occupancy=args.lambda_occupancy,
         lambda_surface=args.lambda_surface,
-        lambda_prior=args.lambda_prior,
+        lambda_prior=0.0,
         use_depth_loss=args.use_depth_loss,
         use_silhouette_loss=args.use_silhouette_loss,
         use_surface_loss=args.use_surface_loss,
-        use_prior_preservation=args.use_prior_preservation,
+        use_prior_preservation=False,
         surface_backend=args.surface_backend,
         extensions_root=args.extensions_root,
         render_resolution=args.loss_render_resolution,
@@ -206,6 +287,7 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
     metrics_path = Path(args.output_dir) / "metrics.jsonl"
     csv_path = Path(args.output_dir) / "metrics.csv"
     sampler.set_epoch(epoch)
+    sampler.set_start_index(batches_seen_in_epoch)
     dataset.set_epoch(epoch)
     iterator = iter(loader)
     optimizer.zero_grad(set_to_none=True)
@@ -215,6 +297,8 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
         last_payload: Dict[str, Any] = {}
         dataloader_seconds = 0.0
         profile_timings: Dict[str, Any] = {}
+        step_healthy = True
+        optimizer_skip_reason = ""
         for accumulation_index in range(args.gradient_accumulation_steps):
             fetch_start = time.perf_counter()
             try:
@@ -222,9 +306,12 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
             except StopIteration:
                 epoch += 1
                 sampler.set_epoch(epoch)
+                sampler.set_start_index(0)
                 dataset.set_epoch(epoch)
+                batches_seen_in_epoch = 0
                 iterator = iter(loader)
                 cpu_batch = next(iterator)
+            batches_seen_in_epoch += 1
             dataloader_seconds += time.perf_counter() - fetch_start
             h2d_timer = CudaStageTimer(device, args.profile)
             h2d_timer.start()
@@ -250,23 +337,71 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
                     device,
                 )
                 loss = payload["losses"]["loss_total"] / args.gradient_accumulation_steps
-                if not torch.isfinite(loss):
-                    raise FloatingPointError(f"Non-finite loss at step={step}, uid={batch['uid']}")
-                scaler.scale(loss).backward()
-            accumulated_loss += loss.detach()
+                local_loss_finite = bool(torch.isfinite(loss).item())
+                local_loss_requires_grad = bool(loss.requires_grad)
+                loss_finite_on_all_ranks = distributed_all_true(
+                    local_loss_finite, device
+                )
+                loss_graph_on_all_ranks = distributed_all_true(
+                    local_loss_requires_grad, device
+                )
+                if not loss_finite_on_all_ranks:
+                    step_healthy = False
+                    optimizer_skip_reason = "nonfinite_loss_on_at_least_one_rank"
+                elif not loss_graph_on_all_ranks:
+                    step_healthy = False
+                    optimizer_skip_reason = "graphless_loss_on_at_least_one_rank"
+                payload["loss_finite"] = local_loss_finite
+                payload["loss_requires_grad"] = local_loss_requires_grad
+                # Persist the exact sample state before backward.  If autograd
+                # itself raises, the responsible UID/rank/view set is retained.
+                append_pathology_record(
+                    Path(args.output_dir) / f"pathologies_rank{rank}.jsonl",
+                    step=step,
+                    accumulation_index=accumulation_index,
+                    rank=rank,
+                    batch=batch,
+                    payload=payload,
+                    loss_finite=local_loss_finite,
+                    loss_requires_grad=local_loss_requires_grad,
+                )
+                if step_healthy:
+                    scaler.scale(loss).backward()
+            accumulated_loss += torch.nan_to_num(
+                loss.detach(), nan=0.0, posinf=0.0, neginf=0.0
+            )
             last_payload = payload
             profile_timings.update(payload["timings"])
 
         backward_timer = CudaStageTimer(device, args.profile)
         backward_timer.start()
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable.parameters(), args.gradient_clip_norm)
-        if not torch.isfinite(grad_norm):
-            raise FloatingPointError(f"Non-finite gradient norm at step={step}")
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer_step_applied = False
+        grad_norm = torch.zeros((), device=device)
+        if step_healthy:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable.parameters(), args.gradient_clip_norm
+            )
+            gradients_finite_on_all_ranks = distributed_all_true(
+                bool(torch.isfinite(grad_norm).item()), device
+            )
+            if gradients_finite_on_all_ranks:
+                scaler.step(optimizer)
+                scaler.update()
+                parameters_finite = distributed_all_true(
+                    trainable_parameters_are_finite(trainable), device
+                )
+                if not parameters_finite:
+                    raise FloatingPointError(
+                        "AdamW produced a non-finite SS parameter update; the last saved checkpoint remains the recovery boundary"
+                    )
+                scheduler.step()
+                optimizer_step_applied = True
+            else:
+                optimizer_skip_reason = "nonfinite_gradient_on_at_least_one_rank"
+                if scaler.is_enabled():
+                    scaler.update(new_scale=max(float(scaler.get_scale()) * 0.5, 1.0))
         optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
         profile_timings["optimizer"] = backward_timer.stop()
 
         reduced_loss = distributed_mean(accumulated_loss)
@@ -284,6 +419,8 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
             batch,
             world_size,
             device,
+            optimizer_step_applied,
+            optimizer_skip_reason,
         )
         if rank == 0:
             append_metrics(metrics_path, csv_path, metrics)
@@ -300,6 +437,7 @@ def run_training(args: argparse.Namespace, context: Dict[str, Any]) -> None:
                 epoch,
                 args,
                 rank,
+                batches_seen_in_epoch,
             )
         if validation_loader is not None and step % args.validate_every == 0:
             validation_metrics = run_validation(
@@ -341,7 +479,9 @@ def forward_training_batch(
     vggt_timer.start()
     geometry = vggt.extract(batch["images"], valid_view_mask=batch["view_valid_mask"])
     vggt_ms = vggt_timer.stop()
-    x0 = batch["ss_latent_grid"].float()
+    raw_x0 = batch["ss_latent_grid"].float()
+    latent_valid = torch.isfinite(raw_x0).flatten(1).all(dim=1)
+    x0 = torch.nan_to_num(raw_x0, nan=0.0, posinf=0.0, neginf=0.0)
     noise = torch.randn_like(x0)
     timestep = sample_timestep(x0.shape[0], device, args)
     x_t, v_target_grid, flow_backend = construct_flow_training_pair(
@@ -350,21 +490,28 @@ def forward_training_batch(
     trellis_timer = CudaStageTimer(device, args.profile)
     trellis_timer.start()
     with torch.inference_mode():
-        condition = encode_real_trellis_condition(pipeline, batch["images"], precision)
+        fallback_condition, condition_valid = encode_real_trellis_condition(
+            pipeline, batch["images"], precision, return_validity=True
+        )
+        dino_spatial_features = extract_dinov2_spatial_features(
+            pipeline.models["image_cond_model"],
+            pipeline.image_cond_model_transform,
+            batch["images"],
+            image_size=518,
+            amp_dtype=precision,
+        )
         timestep_model = timestep * 1000.0
-        v_base_grid = base_flow(x_t, timestep_model, condition)
     trellis_ms = trellis_timer.stop()
-    x_tokens = ss_grid_to_tokens(x_t)
-    base_tokens = ss_grid_to_tokens(v_base_grid)
     target_tokens = ss_grid_to_tokens(v_target_grid)
     with torch.autocast(device_type=device.type, dtype=precision, enabled=device.type == "cuda"):
         try:
-            fused, adapted, branch_timings = trainable(
+            fused, prediction, branch_timings = trainable(
                 geometry,
                 batch,
-                x_tokens,
+                x_t,
                 timestep_model,
-                base_tokens,
+                fallback_condition,
+                dino_spatial_features,
                 profile=args.profile,
             )
         except RuntimeError as exc:
@@ -372,19 +519,25 @@ def forward_training_batch(
                 f"SS voxel fusion failed for uid={batch.get('uid')}, "
                 f"view_ids={batch.get('view_ids')}: {exc}"
             ) from exc
-        v_final_grid = tokens_to_ss_grid(adapted.v_final, (16, 16, 16))
+        v_final_grid = prediction.velocity
+        v_final_tokens = ss_grid_to_tokens(v_final_grid)
+        flow_valid = torch.isfinite(v_final_grid).flatten(1).all(dim=1)
+        foundation_valid = latent_valid & condition_valid & flow_valid
         predicted_clean = velocity_to_clean_state(x_t, v_final_grid, timestep, args.sigma_min)
         target_surface_points, target_surface_weights = (
-            surface_targets_from_fusion(fused) if args.use_surface_loss else (None, None)
+            surface_targets_from_fusion(fused)
+            if args.use_surface_loss and fused.voxel_indices.numel() > 0
+            else (None, None)
         )
         loss_timer = CudaStageTimer(device, args.profile)
         loss_timer.start()
         losses = loss_builder(
-            v_final=adapted.v_final,
+            v_final=v_final_tokens,
             v_target=target_tokens,
-            v_base=base_tokens,
-            gate=adapted.gate,
+            v_base=torch.zeros_like(v_final_tokens),
+            gate=torch.ones_like(fused.voxel_confidence),
             valid_mask=torch.ones_like(fused.valid_mask),
+            sample_weight=foundation_valid.float(),
             predicted_clean_grid=predicted_clean,
             ss_decoder=(
                 decoder
@@ -393,6 +546,7 @@ def forward_training_batch(
             ),
             gt_occ=batch.get("gt_occ") if args.use_occupancy_loss else None,
             masks=batch.get("masks"),
+            view_valid_mask=batch.get("view_valid_mask"),
             K_dataset=batch.get("K_dataset"),
             c2w_dataset=batch.get("c2w_dataset"),
             canonical_center=batch.get("canonical_center"),
@@ -400,17 +554,55 @@ def forward_training_batch(
             vggt_depth=geometry.depth,
             vggt_depth_confidence=geometry.depth_confidence,
             alignment_scale=fused.alignment_scale,
+            alignment_quality=fused.alignment_plausible_fraction,
+            depth_target=fused.aligned_depth,
+            depth_supervision_weight=fused.depth_supervision_weight,
             target_surface_points=target_surface_points,
             target_surface_weights=target_surface_weights,
         )
         losses_ms = loss_timer.stop()
+    conditioning_available = (
+        fused.conditioning_available
+        if fused.conditioning_available is not None
+        else fused.observation_mask.flatten(1).any(dim=1)
+    )
+    weak_evidence_only = (
+        fused.weak_evidence_only
+        if fused.weak_evidence_only is not None
+        else torch.zeros_like(conditioning_available)
+    )
+    positive_weights = fused.accumulated_weight[fused.observation_mask]
     return {
         "losses": losses,
-        "adapter_diagnostics": adapted.diagnostics,
+        "adapter_diagnostics": prediction.diagnostics,
         "flow_backend": flow_backend,
         "observed_fraction": fused.observation_mask.float().mean(),
+        "observed_voxel_count": fused.observation_mask.sum(),
+        "conditioning_available": conditioning_available.float().mean(),
+        "weak_evidence_only": weak_evidence_only.float().mean(),
+        "minimum_positive_observation_weight": (
+            positive_weights.min() if positive_weights.numel() else fused.accumulated_weight.new_zeros(())
+        ),
+        "maximum_observation_weight": fused.accumulated_weight.max(),
         "alignment_plausible_fraction": fused.alignment_plausible_fraction.mean(),
         "alignment_scale": fused.alignment_scale.mean(),
+        "alignment_mode": fused.alignment_mode,
+        "geometry_available": (
+            fused.geometry_available.float().mean()
+            if fused.geometry_available is not None
+            else fused.observation_mask.float().flatten(1).any(dim=1).float().mean()
+        ),
+        "geometry_quality": (
+            fused.geometry_quality.mean()
+            if fused.geometry_quality is not None
+            else fused.alignment_plausible_fraction.mean()
+        ),
+        "geometry_status": fused.geometry_status,
+        "geometry_reason": fused.geometry_reason,
+        "foundation_valid": foundation_valid.float().mean(),
+        "foundation_reason": _foundation_failure_reason(
+            latent_valid, condition_valid, flow_valid
+        ),
         "timings": {"vggt_forward": vggt_ms, "frozen_trellis_forward": trellis_ms, "losses": losses_ms, **branch_timings},
     }
 
@@ -425,6 +617,21 @@ def surface_targets_from_fusion(fused) -> tuple[torch.Tensor, torch.Tensor]:
     local_keys = indices[:, 3] + resolution * indices[:, 2] + resolution**2 * indices[:, 1]
     weights = fused.voxel_confidence[batch_ids, local_keys, 0].float().clamp_min(1e-6)
     return fused.voxel_xyz.unsqueeze(0), weights.unsqueeze(0)
+
+
+def _foundation_failure_reason(
+    latent_valid: torch.Tensor,
+    condition_valid: torch.Tensor,
+    base_flow_valid: torch.Tensor,
+) -> str:
+    reasons = []
+    if not bool(latent_valid.all()):
+        reasons.append("nonfinite_ss_latent")
+    if not bool(condition_valid.all()):
+        reasons.append("nonfinite_trellis_image_condition")
+    if not bool(base_flow_valid.all()):
+        reasons.append("nonfinite_frozen_base_velocity")
+    return ",".join(reasons)
 
 
 def build_validation_loader(args, rank: int, world_size: int, device: torch.device):
@@ -569,6 +776,7 @@ def load_frozen_foundations(args, device):
         args.trellis_model,
         args.hf_cache_root,
         required_file="pipeline.json",
+        validate_trellis_pipeline=True,
     )
     try:
         pipeline = TrellisImageTo3DPipeline.from_pretrained(trellis_source)
@@ -605,39 +813,36 @@ def load_frozen_foundations(args, device):
     return vggt, pipeline, base_flow, decoder
 
 
-def resolve_local_hf_snapshot(model_or_path: str, cache_root: str, *, required_file: str) -> str:
-    """Resolve a model to a complete local snapshot without implicit network I/O."""
-    explicit = Path(model_or_path).expanduser()
-    if explicit.is_dir():
-        if not (explicit / required_file).is_file():
-            raise FileNotFoundError(f"Local model path lacks {required_file}: {explicit}")
-        return str(explicit.resolve())
-    if "/" not in model_or_path:
-        raise FileNotFoundError(f"Expected a local model directory or Hugging Face repo id, got {model_or_path!r}")
-    repository = Path(cache_root).expanduser() / f"models--{model_or_path.replace('/', '--')}" / "snapshots"
-    if not repository.is_dir():
-        raise FileNotFoundError(
-            f"No local snapshots for {model_or_path!r} under {repository}; production training will not download implicitly"
-        )
-    candidates = [path for path in repository.iterdir() if path.is_dir() and (path / required_file).is_file()]
-    if not candidates:
-        raise FileNotFoundError(f"No complete local {model_or_path!r} snapshot contains {required_file} under {repository}")
-    selected = max(candidates, key=lambda path: path.stat().st_mtime_ns)
-    return str(selected.resolve())
-
-
 @torch.inference_mode()
-def encode_real_trellis_condition(pipeline, images: torch.Tensor, precision: torch.dtype) -> torch.Tensor:
+def encode_real_trellis_condition(
+    pipeline,
+    images: torch.Tensor,
+    precision: torch.dtype,
+    *,
+    return_validity: bool = False,
+):
     if images.ndim != 5 or images.shape[0] < 1:
         raise ValueError(f"Images must be real [B,V,3,H,W], got {tuple(images.shape)}")
-    first_view = torch.nn.functional.interpolate(
-        images[:, 0].float(), (518, 518), mode="bicubic", align_corners=False, antialias=True
+    batch_size, views = images.shape[:2]
+    all_views = torch.nn.functional.interpolate(
+        images.reshape(batch_size * views, 3, *images.shape[-2:]).float(),
+        (518, 518),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
     ).clamp(0, 1)
     with torch.autocast(device_type=images.device.type, dtype=precision, enabled=images.device.type == "cuda"):
-        condition = pipeline.encode_image(first_view)
-    if condition.ndim != 3 or condition.shape[-1] != 1024 or not torch.isfinite(condition).all():
+        condition = pipeline.encode_image(all_views)
+    if condition.ndim != 3 or condition.shape[-1] != 1024:
         raise RuntimeError(f"Real TRELLIS DINO condition contract failed: {tuple(condition.shape)}")
-    return condition
+    tokens = condition.shape[1]
+    valid = torch.isfinite(condition).flatten(1).all(dim=1).reshape(
+        batch_size, views
+    ).any(dim=1)
+    condition = torch.nan_to_num(
+        condition.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ).to(dtype=condition.dtype).reshape(batch_size, views * tokens, 1024)
+    return (condition, valid) if return_validity else condition
 
 
 def velocity_to_clean_state(x_t: torch.Tensor, velocity: torch.Tensor, t: torch.Tensor, sigma_min: float) -> torch.Tensor:
@@ -705,13 +910,47 @@ def distributed_mean(value: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def maybe_resume(path, model, optimizer, scheduler, scaler, device, rank: int) -> tuple[int, int]:
+def distributed_all_true(local_value: bool, device: torch.device) -> bool:
+    """Rank-synchronous health decision used before backward/optimizer collectives."""
+    flag = torch.tensor(1 if local_value else 0, device=device, dtype=torch.int32)
+    if dist.is_initialized():
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def maybe_resume(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    device,
+    rank: int,
+    *,
+    batches_per_epoch: int,
+    gradient_accumulation_steps: int,
+) -> tuple[int, int, int]:
     if path is None:
-        return 0, 0
+        return 0, 0, 0
     checkpoint_path = Path(path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
     payload = torch.load(checkpoint_path, map_location=device)
+    architecture_version = payload.get("architecture_version")
+    if architecture_version != AffostructionSSFlow.architecture_version:
+        raise RuntimeError(
+            "Resume checkpoint belongs to a different SS propagation graph: "
+            f"checkpoint={architecture_version!r}, required={AffostructionSSFlow.architecture_version!r}. "
+            "Use the legacy checkpoint for inference or start this full-backbone migration from TRELLIS weights."
+        )
+    numerics_version = payload.get("optimization_numerics_version")
+    if numerics_version != SS_OPTIMIZATION_NUMERICS_VERSION:
+        raise RuntimeError(
+            "Resume checkpoint was produced before FP32-master optimization was enforced: "
+            f"checkpoint={numerics_version!r}, required={SS_OPTIMIZATION_NUMERICS_VERSION!r}. "
+            "Restart from the original TRELLIS weights."
+        )
+    assert_state_dict_finite(payload["model"], f"SS checkpoint {checkpoint_path}")
     model.load_state_dict(payload["model"], strict=True)
     optimizer.load_state_dict(payload["optimizer"])
     scheduler.load_state_dict(payload["scheduler"])
@@ -732,10 +971,30 @@ def maybe_resume(path, model, optimizer, scheduler, scaler, device, rank: int) -
             torch.cuda.set_rng_state(payload["cuda_rng"].cpu(), device)
         if rank != 0:
             seed_everything(int(payload.get("args", {}).get("seed", 42)) + 1_000_003 * int(payload["step"]), rank)
-    return int(payload["step"]), int(payload["epoch"])
+    step = int(payload["step"])
+    batches_seen = payload.get("batches_seen_in_epoch")
+    if batches_seen is None:
+        # Legacy checkpoints omitted the sampler cursor. Global optimizer-step
+        # count is the only faithful reconstruction when no epoch boundary was
+        # recorded between saves.
+        batches_seen = (
+            step * int(gradient_accumulation_steps)
+        ) % max(int(batches_per_epoch), 1)
+    return step, int(payload["epoch"]), int(batches_seen)
 
 
-def save_checkpoint(path, model, optimizer, scheduler, scaler, step, epoch, args, rank: int) -> None:
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    step,
+    epoch,
+    args,
+    rank: int,
+    batches_seen_in_epoch: int,
+) -> None:
     local_rng = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
@@ -750,15 +1009,21 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, step, epoch, args
     if rank != 0:
         return
     unwrapped = model.module if isinstance(model, DDP) else model
+    assert_fp32_finite_trainable_parameters(
+        unwrapped, f"SS checkpoint step {step}"
+    )
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
+            "architecture_version": AffostructionSSFlow.architecture_version,
+            "optimization_numerics_version": SS_OPTIMIZATION_NUMERICS_VERSION,
             "model": unwrapped.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "step": step,
             "epoch": epoch,
+            "batches_seen_in_epoch": int(batches_seen_in_epoch),
             "args": vars(args),
             "rng_by_rank": rng_by_rank,
             # Retain legacy fields for older readers.
@@ -775,24 +1040,106 @@ def report_parameter_counts(rank: int, trainable: nn.Module, frozen_modules: Ite
         return
     train_count = sum(parameter.numel() for parameter in trainable.parameters() if parameter.requires_grad)
     frozen_count = 0
-    seen = set()
+    seen = {
+        id(parameter)
+        for parameter in trainable.parameters()
+        if parameter.requires_grad
+    }
     for module in frozen_modules:
         modules = module.models.values() if hasattr(module, "models") else (module,)
         for item in modules:
             if not isinstance(item, nn.Module):
                 continue
             for parameter in item.parameters():
-                if id(parameter) not in seen:
+                if not parameter.requires_grad and id(parameter) not in seen:
                     frozen_count += parameter.numel()
                     seen.add(id(parameter))
-    if train_count >= frozen_count:
-        raise RuntimeError(f"Adapter parameter invariant failed: trainable={train_count}, frozen={frozen_count}")
-    print(json.dumps({"trainable_parameters": train_count, "frozen_parameters": frozen_count}))
+    if train_count <= 0:
+        raise RuntimeError("Affostruction SS full-backbone graph has no trainable parameters")
+    print(
+        json.dumps(
+            {
+                "architecture_version": AffostructionSSFlow.architecture_version,
+                "trainable_parameters": train_count,
+                "frozen_foundation_parameters": frozen_count,
+            }
+        )
+    )
 
 
-def build_metrics(step, epoch, loss, payload, timings, dataloader, elapsed, grad_norm, optimizer, batch, world_size, device):
-    adapter = payload["adapter_diagnostics"]
+def assert_fp32_finite_trainable_parameters(module: nn.Module, context: str) -> None:
+    wrong_dtype = [
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad and parameter.dtype != torch.float32
+    ]
+    if wrong_dtype:
+        raise TypeError(
+            f"{context} requires FP32 AdamW master parameters; non-FP32 tensors: {wrong_dtype[:16]}"
+        )
+    if not trainable_parameters_are_finite(module):
+        raise FloatingPointError(f"{context} contains NaN or Inf parameters")
+
+
+def trainable_parameters_are_finite(module: nn.Module) -> bool:
+    checks = [
+        torch.isfinite(parameter.detach()).all()
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    ]
+    return bool(torch.stack(checks).all().item()) if checks else False
+
+
+def assert_state_dict_finite(state: Dict[str, Any], context: str) -> None:
+    invalid = [
+        name
+        for name, value in state.items()
+        if isinstance(value, torch.Tensor)
+        and (value.is_floating_point() or value.is_complex())
+        and not bool(torch.isfinite(value).all().item())
+    ]
+    if invalid:
+        raise FloatingPointError(
+            f"{context} is numerically corrupted; non-finite tensors: {invalid[:16]}"
+        )
+
+
+def warmup_cosine_factor(
+    update: int,
+    *,
+    total_updates: int,
+    warmup_updates: int,
+    minimum_ratio: float,
+) -> float:
+    total = max(int(total_updates), 1)
+    warmup = min(max(int(warmup_updates), 0), max(total - 1, 0))
+    if warmup > 0 and update < warmup:
+        return max((int(update) + 1) / warmup, 1.0 / warmup)
+    progress = (int(update) - warmup) / max(total - warmup, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return float(minimum_ratio + (1.0 - minimum_ratio) * cosine)
+
+
+def build_metrics(
+    step,
+    epoch,
+    loss,
+    payload,
+    timings,
+    dataloader,
+    elapsed,
+    grad_norm,
+    optimizer,
+    batch,
+    world_size,
+    device,
+    optimizer_step_applied=True,
+    optimizer_skip_reason="",
+):
+    diagnostics = payload["adapter_diagnostics"]
     losses = payload["losses"]
+    loss_diagnostics = losses["diagnostics"]
     views = int(batch["view_valid_mask"].sum().item())
     uid = batch.get("uid", [""])
     uid = uid[0] if isinstance(uid, (list, tuple)) else uid
@@ -803,20 +1150,67 @@ def build_metrics(step, epoch, loss, payload, timings, dataloader, elapsed, grad
         "uid": uid,
         "view_ids": selected_view_ids,
         "loss_total": float(loss.cpu()),
-        "loss_cfm": float(losses["loss_cfm"].detach().float().cpu()),
-        "loss_depth": float(losses["loss_depth"].detach().float().cpu()),
-        "loss_silhouette": float(losses["loss_silhouette"].detach().float().cpu()),
-        "loss_occupancy": float(losses["loss_occupancy"].detach().float().cpu()),
-        "loss_surface": float(losses["loss_surface"].detach().float().cpu()),
-        "loss_prior": float(losses["loss_prior"].detach().float().cpu()),
-        "adapter_norm": float(adapter["mean_adapter_norm"].detach().float().cpu()),
-        "residual_base_ratio": float(adapter["residual_base_ratio"].detach().float().cpu()),
-        "observed_percent": float(adapter["percentage_observed"].detach().float().cpu()),
+        "loss_cfm": float(distributed_mean(losses["loss_cfm"]).cpu()),
+        "loss_depth": float(distributed_mean(losses["loss_depth"]).cpu()),
+        "loss_silhouette": float(distributed_mean(losses["loss_silhouette"]).cpu()),
+        "loss_occupancy": float(distributed_mean(losses["loss_occupancy"]).cpu()),
+        "loss_surface": float(distributed_mean(losses["loss_surface"]).cpu()),
+        "loss_prior": float(distributed_mean(losses["loss_prior"]).cpu()),
+        "architecture_version": AffostructionSSFlow.architecture_version,
+        "backbone_velocity_norm": float(diagnostics["mean_adapter_norm"].detach().float().cpu()),
+        "conditioning_voxel_count": float(diagnostics["conditioning_voxel_count"].detach().float().cpu()),
+        "geometry_condition_fraction": float(diagnostics["geometry_condition_fraction"].detach().float().cpu()),
+        "observed_percent": float(diagnostics["percentage_observed"].detach().float().cpu()),
         "alignment_plausible_percent": float(
             100.0 * payload["alignment_plausible_fraction"].detach().float().cpu()
         ),
         "alignment_scale": float(payload["alignment_scale"].detach().float().cpu()),
+        "alignment_mode": payload["alignment_mode"],
+        "geometry_available": bool(payload["geometry_available"].detach().float().cpu() > 0.5),
+        "conditioning_available": bool(
+            payload["conditioning_available"].detach().float().cpu() > 0.5
+        ),
+        "weak_evidence_only": bool(
+            payload["weak_evidence_only"].detach().float().cpu() > 0.5
+        ),
+        "observed_voxel_count": int(
+            payload["observed_voxel_count"].detach().cpu()
+        ),
+        "minimum_positive_observation_weight": float(
+            payload["minimum_positive_observation_weight"].detach().float().cpu()
+        ),
+        "maximum_observation_weight": float(
+            payload["maximum_observation_weight"].detach().float().cpu()
+        ),
+        "geometry_quality_percent": float(
+            100.0 * payload["geometry_quality"].detach().float().cpu()
+        ),
+        "geometry_status": payload["geometry_status"],
+        "geometry_reason": payload["geometry_reason"],
+        "foundation_valid": bool(payload["foundation_valid"].detach().float().cpu() > 0.5),
+        "foundation_reason": payload["foundation_reason"],
+        "decoder_numerically_valid": bool(
+            loss_diagnostics.get("decoder_numerically_valid", True)
+        ),
+        "decoder_empty_active": bool(loss_diagnostics.get("decoder_empty_active", False)),
+        "decoder_active_percent": float(
+            100.0 * _diagnostic_scalar(loss_diagnostics, "decoder_active_fraction", 0.0)
+        ),
+        "decoder_mean_occupancy_probability": float(
+            _diagnostic_scalar(
+                loss_diagnostics, "decoder_mean_occupancy_probability", 0.0
+            )
+        ),
+        "depth_supervision_available": bool(
+            loss_diagnostics.get("depth_available", False)
+        ),
+        "adapter_numerical_fallback": bool(
+            _diagnostic_scalar(diagnostics, "adapter_numerical_fallback", 0.0) > 0.5
+        ),
         "grad_norm": float(grad_norm.detach().float().cpu()),
+        "optimizer_step_applied": bool(optimizer_step_applied),
+        "optimizer_skip_reason": optimizer_skip_reason,
+        "loss_requires_grad": bool(payload.get("loss_requires_grad", True)),
         "learning_rate": optimizer.param_groups[0]["lr"],
         "flow_backend": payload["flow_backend"],
         "dataloader_wait": dataloader,
@@ -848,6 +1242,101 @@ def append_metrics(jsonl_path: Path, csv_path: Path, metrics: Dict[str, Any]) ->
         if new_file:
             writer.writeheader()
         writer.writerow(flat)
+
+
+def append_pathology_record(
+    path: Path,
+    *,
+    step: int,
+    accumulation_index: int,
+    rank: int,
+    batch: Dict[str, Any],
+    payload: Dict[str, Any],
+    loss_finite: bool,
+    loss_requires_grad: bool,
+) -> None:
+    """Persist non-normal sample outcomes independently on every DDP rank."""
+    diagnostics = payload["losses"]["diagnostics"]
+    adapter = payload["adapter_diagnostics"]
+    decoder_empty = bool(diagnostics.get("decoder_empty_active", False))
+    decoder_valid = bool(diagnostics.get("decoder_numerically_valid", True))
+    adapter_fallback = _diagnostic_scalar(
+        adapter, "adapter_numerical_fallback", 0.0
+    ) > 0.5
+    geometry_status = str(payload.get("geometry_status", "usable"))
+    conditioning_available = _diagnostic_scalar(
+        payload, "conditioning_available", 1.0
+    ) > 0.5
+    weak_evidence_only = _diagnostic_scalar(
+        payload, "weak_evidence_only", 0.0
+    ) > 0.5
+    foundation_valid = bool(
+        float(payload.get("foundation_valid", torch.tensor(1.0)).detach().float().cpu())
+        > 0.5
+    )
+    if (
+        geometry_status == "usable"
+        and conditioning_available
+        and not weak_evidence_only
+        and foundation_valid
+        and not decoder_empty
+        and decoder_valid
+        and not adapter_fallback
+        and loss_finite
+        and loss_requires_grad
+    ):
+        return
+    uid = batch.get("uid", [""])
+    uid = uid[0] if isinstance(uid, (list, tuple)) else uid
+    view_mask = batch["view_valid_mask"]
+    record = {
+        "event": "sample_pathology",
+        "step": step,
+        "accumulation_index": accumulation_index,
+        "rank": rank,
+        "uid": uid,
+        "view_ids": batch["view_ids"][view_mask].detach().cpu().tolist(),
+        "geometry_status": geometry_status,
+        "geometry_reason": payload.get("geometry_reason", ""),
+        "conditioning_available": conditioning_available,
+        "weak_evidence_only": weak_evidence_only,
+        "observed_voxel_count": int(
+            _diagnostic_scalar(payload, "observed_voxel_count", 0.0)
+        ),
+        "minimum_positive_observation_weight": _diagnostic_scalar(
+            payload, "minimum_positive_observation_weight", 0.0
+        ),
+        "maximum_observation_weight": _diagnostic_scalar(
+            payload, "maximum_observation_weight", 0.0
+        ),
+        "foundation_valid": foundation_valid,
+        "foundation_reason": payload.get("foundation_reason", ""),
+        "alignment_mode": payload.get("alignment_mode", ""),
+        "geometry_quality_percent": 100.0
+        * float(payload["geometry_quality"].detach().float().cpu()),
+        "decoder_numerically_valid": decoder_valid,
+        "decoder_empty_active": decoder_empty,
+        "decoder_active_percent": 100.0
+        * _diagnostic_scalar(diagnostics, "decoder_active_fraction", 0.0),
+        "decoder_mean_occupancy_probability": _diagnostic_scalar(
+            diagnostics, "decoder_mean_occupancy_probability", 0.0
+        ),
+        "depth_supervision_available": bool(diagnostics.get("depth_available", False)),
+        "adapter_numerical_fallback": adapter_fallback,
+        "loss_finite": bool(loss_finite),
+        "loss_requires_grad": bool(loss_requires_grad),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=json_default) + "\n")
+
+
+def _diagnostic_scalar(mapping: Dict[str, Any], key: str, default: float) -> float:
+    value = mapping.get(key, default)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return float(default)
+        return float(value.detach().float().mean().cpu())
+    return float(value)
 
 
 def json_default(value):
@@ -913,20 +1402,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--adam-epsilon", type=float, default=1e-8)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--classifier-free-dropout", type=float, default=0.1)
     parser.add_argument("--sigma-min", type=float, default=1e-5)
     parser.add_argument("--timestep-sampling", choices=("uniform", "logit_normal"), default="logit_normal")
     parser.add_argument("--timestep-logit-mean", type=float, default=0.0)
     parser.add_argument("--timestep-logit-std", type=float, default=1.0)
     parser.add_argument("--flow-backend", choices=("auto", "torch", "triton"), default="auto")
-    parser.add_argument("--voxel-feature-dim", type=int, default=256)
-    parser.add_argument("--positional-frequencies", type=int, default=4)
-    parser.add_argument("--adapter-hidden-dim", type=int, default=256)
-    parser.add_argument("--adapter-heads", type=int, default=8)
-    parser.add_argument("--adapter-blocks", type=int, default=2)
-    parser.add_argument("--trust-region", type=float, default=0.25)
-    parser.add_argument("--g-observed", type=float, default=1.0)
-    parser.add_argument("--g-unobserved", type=float, default=0.0)
     parser.add_argument("--fusion-mode", choices=("confidence", "average_ablation"), default="confidence")
     for name, default in (
         ("use-stochastic-views", True),
@@ -935,13 +1419,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("use-confidence-weighting", True),
         ("use-visibility-weighting", True),
         ("use-3d-positional-encoding", True),
-        ("use-observation-gate", True),
-        ("use-prior-preservation", True),
         ("use-occupancy-loss", True),
         ("use-depth-loss", True),
         ("use-silhouette-loss", True),
         ("use-surface-loss", False),
-        ("use-spconv-refinement", True),
+        ("use-spconv-refinement", False),
     ):
         parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction, default=default)
     parser.add_argument("--surface-backend", choices=("geomloss", "frnn"), default="geomloss")
@@ -950,7 +1432,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-silhouette", type=float, default=0.1)
     parser.add_argument("--lambda-occupancy", type=float, default=0.5)
     parser.add_argument("--lambda-surface", type=float, default=0.05)
-    parser.add_argument("--lambda-prior", type=float, default=0.01)
     parser.add_argument("--loss-render-resolution", type=int, default=64)
     parser.add_argument("--loss-ray-samples", type=int, default=48)
     parser.add_argument("--save-every", type=int, default=100)

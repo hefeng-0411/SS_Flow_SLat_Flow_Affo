@@ -161,6 +161,27 @@ def test_sparse_teacher_prediction_is_repadded_by_coordinate_not_row_order():
     assert torch.equal(padded, torch.tensor([[[10.0], [40.0], [0.0]]]))
 
 
+def test_sparse_teacher_prediction_repads_multiple_objects_without_cross_talk():
+    target_indices = torch.tensor(
+        [
+            [[1, 2, 3], [4, 5, 6], [0, 0, 0]],
+            [[4, 5, 6], [1, 2, 3], [7, 8, 9]],
+        ]
+    )
+    valid = torch.tensor([[True, True, False], [True, False, True]])
+    coords = torch.tensor(
+        [[1, 7, 8, 9], [0, 4, 5, 6], [1, 4, 5, 6], [0, 1, 2, 3]]
+    )
+    feats = torch.tensor([[79.0], [46.0], [146.0], [13.0]])
+    padded = _repad_sparse_prediction(
+        feats, coords, target_indices, valid, dtype=torch.float32
+    )
+    expected = torch.tensor(
+        [[[13.0], [46.0], [0.0]], [[146.0], [0.0], [79.0]]]
+    )
+    assert torch.equal(padded, expected)
+
+
 def test_slat_wrapper_residual_scale_cancels_cfg_amplification():
     class ZeroFlow(torch.nn.Module):
         in_channels = 2

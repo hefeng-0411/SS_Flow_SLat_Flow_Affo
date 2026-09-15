@@ -7,6 +7,105 @@ import torch.nn as nn
 
 from geoss.slat.models.slat_velocity_adapter import SLATVelocityAdapter
 from geoss.slat.utils.active_voxel_utils import pad_sparse_tensor_tokens, unpad_sparse_tensor_tokens
+from geoss.models.affostruction_conditioning import compact_condition_tokens
+from geoss.slat.models.slat_flow_adapter import (
+    AFFOSTRUCTION_IMAGE_SLAT_ARCHITECTURE,
+    _align_sparse_features,
+)
+
+
+class DirectConditionedTrellisSLATWrapper(nn.Module):
+    """Add an independent VGGT-conditioned sparse flow to frozen TRELLIS velocity."""
+
+    architecture_version = AFFOSTRUCTION_IMAGE_SLAT_ARCHITECTURE
+
+    def __init__(
+        self,
+        slat_flow_model: nn.Module,
+        correction_flow: nn.Module,
+        *,
+        apply_to_unconditional: bool = False,
+        residual_limit: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.slat_flow_model = slat_flow_model.eval().requires_grad_(False)
+        self.correction_flow = correction_flow.eval().requires_grad_(False)
+        self.apply_to_unconditional = bool(apply_to_unconditional)
+        self.residual_limit = float(residual_limit)
+        self.last_debug: Dict[str, Any] = {}
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError as original_error:
+            wrapped = self.__dict__.get("_modules", {}).get("slat_flow_model")
+            if wrapped is not None and hasattr(wrapped, name):
+                return getattr(wrapped, name)
+            raise original_error
+
+    def forward(
+        self,
+        x,
+        t: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        *,
+        geovis_slat_context: Optional[Dict[str, torch.Tensor]] = None,
+        geovis_branch: str = "cond",
+        geovis_residual_scale: float = 1.0,
+        **kwargs,
+    ):
+        base = self.slat_flow_model(x, t, cond, **kwargs)
+        if geovis_slat_context is None or (
+            geovis_branch == "uncond" and not self.apply_to_unconditional
+        ):
+            self.last_debug = {"direct_voxel_condition": False, "branch": geovis_branch}
+            return base
+        tokens = geovis_slat_context.get(
+            "condition", geovis_slat_context.get("slat_cond_tokens")
+        )
+        valid = geovis_slat_context.get(
+            "condition_valid", geovis_slat_context.get("slat_token_valid_mask")
+        )
+        if not isinstance(tokens, torch.Tensor) or not isinstance(valid, torch.Tensor):
+            raise KeyError("Direct SLat context requires condition tokens and a validity mask")
+        compact = compact_condition_tokens(tokens, valid)
+        if bool((compact.counts == 0).any()):
+            self.last_debug = {
+                "direct_voxel_condition": False,
+                "branch": geovis_branch,
+                "correction": "identity",
+            }
+            return base
+        if compact.tokens.shape[0] != 1:
+            raise RuntimeError("Direct SLat inference requires one object per sampler call")
+        direct_condition = compact.tokens[:, : int(compact.counts[0].item())]
+        raw = self.correction_flow(x, t, direct_condition)
+        raw_features = _align_sparse_features(
+            raw.feats,
+            raw.coords,
+            base.coords,
+            int(getattr(self.correction_flow, "resolution", 64)),
+        ).float()
+        confidence = geovis_slat_context.get("confidence")
+        if not isinstance(confidence, torch.Tensor):
+            confidence = valid[..., None].to(tokens)
+        confidence = confidence.reshape(-1, 1).to(raw_features)
+        if confidence.shape[0] != base.feats.shape[0]:
+            raise RuntimeError("VGGT SLat confidence does not align with sparse TRELLIS support")
+        base_features = base.feats.float()
+        base_rms = torch.sqrt(base_features.square().mean() + 1.0e-4)
+        limit = self.residual_limit * base_rms
+        correction = confidence * limit * torch.tanh(raw_features / limit)
+        correction = correction * float(geovis_residual_scale)
+        output = base.replace((base_features + correction).to(base.feats.dtype))
+        self.last_debug = {
+            "direct_voxel_condition": True,
+            "branch": geovis_branch,
+            "condition_tokens": int(direct_condition.shape[1]),
+            "base_velocity_rms": base_rms.detach(),
+            "correction_rms": correction.square().mean().sqrt().detach(),
+        }
+        return output
 
 
 class GeoVisTrellisSLATWrapper(nn.Module):

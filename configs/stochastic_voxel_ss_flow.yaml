@@ -8,7 +8,7 @@ dataset_root: /mnt/sda/hf/MVG/Base/dataset/c9028d206944a33af776f1b6967a6d82af385
 extensions_root: /mnt/sda/hf/MVG/Base/extensions
 torch_hub_dir: /mnt/sda/hf/.cache/torch/hub
 dinov2_repo: /mnt/sda/hf/.cache/torch/hub/facebookresearch_dinov2_main
-output_dir: outputs/stochastic_voxel_ss_flow
+output_dir: outputs/affostruction_ss_fp32
 
 dataset:
   train_split: train
@@ -23,25 +23,16 @@ dataset:
 
 model:
   grid_resolution: 16
-  voxel_feature_dim: 256
-  positional_frequencies: 4
-  adapter_hidden_dim: 256
-  adapter_heads: 8
-  adapter_blocks: 2
-  trust_region: 0.25
-  g_observed: 1.0
-  g_unobserved: 0.0
+  classifier_free_dropout: 0.1
   fusion_mode: confidence
   use_vggt_depth: true
   use_vggt_pointmap: true
   use_confidence_weighting: true
   use_visibility_weighting: true
   use_3d_positional_encoding: true
-  use_observation_gate: true
-  use_spconv_refinement: true
+  use_spconv_refinement: false
 
 loss:
-  use_prior_preservation: true
   use_occupancy_loss: true
   use_depth_loss: true
   use_silhouette_loss: true
@@ -52,7 +43,6 @@ loss:
   lambda_silhouette: 0.1
   lambda_occupancy: 0.5
   lambda_surface: 0.05
-  lambda_prior: 0.01
   loss_render_resolution: 64
   loss_ray_samples: 48
 
@@ -66,7 +56,9 @@ training:
   gradient_clip_norm: 1.0
   learning_rate: 0.0001
   min_learning_rate: 0.000001
-  weight_decay: 0.01
+  weight_decay: 0.0
+  adam_epsilon: 0.00000001
+  warmup_steps: 500
   sigma_min: 0.00001
   timestep_sampling: logit_normal
   flow_backend: auto

@@ -2,17 +2,16 @@
   "model": {
     "resolution": 64,
     "slat_dim": 8,
-    "evidence_dim": 128,
-    "hidden_dim": 128,
-    "feature_dim": 16,
-    "num_heads": 4,
-    "trust_region": 0.15,
-    "beta_mode": "cosine",
-    "beta_strength": 1.0,
-    "fusion_mode": "aligned",
-    "confidence_floor": 0.05,
-    "factorized_control": true,
-    "use_geovis_slat": true
+    "low_feature_dim": 64,
+    "depth_temperature": 0.04,
+    "occlusion_margin": 0.03,
+    "minimum_incidence": 0.05,
+    "classifier_free_dropout": 0.1,
+    "residual_limit": 1.0
+  },
+  "loss": {
+    "endpoint_weight": 0.25,
+    "prior_weight": 0.01
   },
   "flow": {
     "sigma_min": 1e-5
@@ -25,24 +24,16 @@
     "slat_dim": 8
   },
   "training": {
-    "stage": "geovis_slat_adapter_pretraining",
+    "stage": "vggt_affostruction_sparse_residual_slat_flow",
     "freeze_vggt": true,
     "freeze_trellis_slat_flow": true,
     "freeze_decoder": true,
-    "multiview_teacher": true,
-    "factorized_control_weight": 0.2,
+    "multiview_teacher": false,
     "datasets": ["meshfleet_trellis", "objaverse_cars", "srn_cars"]
   },
   "ablation": {
-    "original_trellis_slat": false,
-    "slat_lora_only": false,
-    "image_feature_concat_condition": false,
-    "without_ss_confidence": false,
-    "without_visibility_evidence": false,
-    "without_depth_residual": false,
-    "without_view_weighting": false,
-    "without_prior_preservation": false,
-    "without_trust_region_clipping": false,
-    "full_geovis_slat_adapter": true
+    "propagation": "independent_sparse_flow_residual_on_frozen_trellis",
+    "pixel_alignment": "kaolin_active_voxel_reprojection",
+    "fusion": "confidence_occlusion_angle_depth_weighted"
   }
 }

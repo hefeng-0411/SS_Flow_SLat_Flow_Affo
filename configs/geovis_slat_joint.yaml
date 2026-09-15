@@ -2,27 +2,42 @@
   "model": {
     "resolution": 64,
     "slat_dim": 8,
-    "evidence_dim": 128,
-    "hidden_dim": 128,
-    "feature_dim": 16,
-    "num_heads": 4,
-    "trust_region": 0.12,
-    "beta_mode": "cosine",
-    "beta_strength": 0.75,
-    "fusion_mode": "aligned",
-    "confidence_floor": 0.05,
-    "use_geovis_slat": true
+    "low_feature_dim": 64,
+    "depth_temperature": 0.04,
+    "occlusion_margin": 0.03,
+    "minimum_incidence": 0.05,
+    "classifier_free_dropout": 0.1,
+    "residual_limit": 1.0
+  },
+  "loss": {
+    "endpoint_weight": 0.25,
+    "prior_weight": 0.01
   },
   "flow": {
     "sigma_min": 1e-5
   },
   "training": {
-    "stage": "ss_geoss_plus_geovis_slat_joint_adapter_finetune",
+    "stage": "ss_plus_vggt_affostruction_sparse_residual_slat_flow",
     "joint_enabled": true,
     "freeze_vggt": true,
     "freeze_trellis_ss_flow": true,
     "freeze_trellis_slat_flow": true,
     "freeze_decoder": true,
-    "train_adapters_only": true
+    "train_sparse_image_flow_only": true
+  },
+  "decoded_supervision": {
+    "enabled": true,
+    "every": 4,
+    "views_per_object": 2,
+    "rgb_weight": 1.0,
+    "mask_weight": 0.5,
+    "depth_weight": 0.1,
+    "feature_weight": 0.25,
+    "cross_view_rgb_weight": 0.25,
+    "geometry_weight": 0.1,
+    "geometry_points": 2048,
+    "feature_grid_size": 12,
+    "sinkhorn_blur": 0.02,
+    "extensions_root": "/mnt/sda/hf/MVG/Base/extensions"
   }
 }

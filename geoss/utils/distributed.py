@@ -122,14 +122,16 @@ def build_dataloader(
         shuffle=shuffle,
         drop_last=drop_last,
     ) if ctx.distributed else None
+    worker_count = int(getattr(args, "num_workers", 0))
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=shuffle and sampler is None,
         sampler=sampler,
-        num_workers=getattr(args, "num_workers", 0),
+        num_workers=worker_count,
         pin_memory=bool(getattr(args, "pin_memory", False)) and ctx.device.type == "cuda",
-        persistent_workers=getattr(args, "num_workers", 0) > 0,
+        persistent_workers=worker_count > 0,
+        prefetch_factor=max(1, int(getattr(args, "prefetch_factor", 2))) if worker_count > 0 else None,
         collate_fn=collate_fn,
         drop_last=drop_last,
     )

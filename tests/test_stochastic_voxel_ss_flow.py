@@ -13,10 +13,12 @@ from geoss.datasets.dataset_stochastic_meshfleet import (
     stochastic_meshfleet_collate,
 )
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryBatch, VGGTGeometryWrapper
-from geoss.models.ss_flow_adapter import SSFlowAdapter
+from geoss.losses.geometric_loss import FlowMatchingLossBuilder
+from geoss.models.ss_flow_adapter import AffostructionSSFlow, SSFlowAdapter
 from geoss.models.voxel_fusion_engine import (
     ConfidenceSparseVoxelFusion,
     VoxelFusionOutput,
+    _maximum_interval_consensus_scale,
     _validate_alignment_retention,
     align_vggt_reference_to_dataset,
     unproject_depth_batched,
@@ -24,7 +26,11 @@ from geoss.models.voxel_fusion_engine import (
 from geoss.ops.flow_matching import construct_flow_training_pair
 from geoss.samplers.fast_ss_sampler import FastGeometryConditionedSSSampler
 from geoss.utils.projection import project_points
-from scripts.train_stochastic_voxel_ss_flow import append_metrics
+from scripts.train_stochastic_voxel_ss_flow import (
+    ResumableDistributedSampler,
+    TrainableVoxelSSBranch,
+    append_metrics,
+)
 
 
 def _make_meshfleet_object(root: Path, views: int = 10, missing: tuple[int, ...] = ()) -> None:
@@ -70,6 +76,19 @@ def test_dataset_stochastic_views_are_bounded_distinct_and_reproducible(tmp_path
         first.set_epoch(epoch)
         epoch_selections.append(tuple(first[0]["view_ids"].tolist()))
     assert len(set(epoch_selections)) > 1
+
+
+def test_distributed_sampler_resume_cursor_preserves_remaining_order():
+    dataset = list(range(17))
+    sampler = ResumableDistributedSampler(
+        dataset, num_replicas=2, rank=1, shuffle=True, seed=13, drop_last=True
+    )
+    sampler.set_epoch(4)
+    complete = list(iter(sampler))
+    sampler.set_start_index(3)
+
+    assert list(iter(sampler)) == complete[3:]
+    assert len(sampler) == len(complete) - 3
 
 
 def test_dataset_gapped_render_ids_keep_image_camera_and_metadata_aligned(tmp_path: Path):
@@ -127,10 +146,274 @@ def test_alignment_reports_rays_that_no_scale_can_place_in_canonical_box():
     assert alignment_inlier.flatten().tolist() == [True, False]
 
 
-def test_logged_9846_percent_alignment_is_retained_but_scene_mismatch_fails():
+def test_partial_alignment_is_retained_but_zero_consensus_fails():
     _validate_alignment_retention(torch.tensor([0.9845559597015381]))
-    with pytest.raises(RuntimeError, match="retained_fractions"):
-        _validate_alignment_retention(torch.tensor([0.899]))
+    _validate_alignment_retention(torch.tensor([0.8705096244812012]))
+    _validate_alignment_retention(torch.tensor([0.01]))
+    with pytest.raises(RuntimeError, match="retained no reliable geometry"):
+        _validate_alignment_retention(torch.tensor([0.0]))
+
+
+def test_scale_uses_maximum_interval_consensus_instead_of_all_ray_intersection():
+    entry = torch.tensor([[1.0] * 99 + [5.0]])
+    exit = torch.tensor([[2.0] * 99 + [6.0]])
+    scale, fraction = _maximum_interval_consensus_scale(
+        torch.tensor([1.5]), entry, exit, torch.ones_like(entry, dtype=torch.bool)
+    )
+
+    assert scale.item() == pytest.approx(1.5)
+    assert fraction.item() == pytest.approx(0.99)
+
+
+def _geometry_with_nonintersecting_pointmap() -> VGGTGeometryBatch:
+    depth = torch.full((1, 1, 1, 2, 2), 2.0)
+    point_map = torch.zeros(1, 1, 3, 2, 2)
+    point_map[:, :, 0] = 10.0
+    identity = torch.eye(4).view(1, 1, 4, 4)
+    intrinsics = torch.tensor(
+        [[[[10.0, 0.0, 0.5], [0.0, 10.0, 0.5], [0.0, 0.0, 1.0]]]]
+    )
+    return VGGTGeometryBatch(
+        depth=depth,
+        depth_confidence=torch.ones(1, 1, 2, 2),
+        point_map=point_map,
+        point_confidence=torch.ones(1, 1, 2, 2),
+        intrinsics=intrinsics,
+        extrinsics=identity,
+        camera_to_world=identity,
+        visual_features=torch.ones(1, 1, 2, 2, 2),
+        valid_view_mask=torch.ones(1, 1, dtype=torch.bool),
+        image_resolution=(2, 2),
+        feature_resolution=(2, 2),
+        patch_size=1,
+    )
+
+
+def _small_fusion() -> ConfidenceSparseVoxelFusion:
+    return ConfidenceSparseVoxelFusion(
+        input_feature_dim=2,
+        projected_feature_dim=4,
+        positional_frequencies=1,
+        require_spconv=False,
+        use_spconv_refinement=False,
+    )
+
+
+def test_nonintersecting_pointmap_falls_back_to_dataset_camera_depth():
+    camera = torch.eye(4).view(1, 1, 4, 4)
+    camera[..., 2, 3] = -2.0
+    fused = _small_fusion()(
+        _geometry_with_nonintersecting_pointmap(),
+        foreground_masks=torch.ones(1, 1, 1, 2, 2),
+        dataset_c2w=camera,
+        canonical_center=torch.zeros(1, 3),
+        canonical_half_extent=torch.full((1, 3), 0.5),
+    )
+
+    assert fused.alignment_mode == "dataset_camera_depth"
+    assert fused.alignment_plausible_fraction.item() > 0
+    assert fused.observation_mask.any()
+
+
+class _DirectSSBackbone(torch.nn.Module):
+    def __init__(self, condition_dim: int) -> None:
+        super().__init__()
+        self.cond_channels = condition_dim
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.seen_condition = None
+
+    def forward(self, state, timestep, condition):
+        del timestep
+        self.seen_condition = condition
+        return state * self.scale + condition.mean() * 0.0
+
+
+def test_no_intersecting_geometry_uses_real_dino_fallback_and_ddp_safe_graph():
+    camera = torch.eye(4).view(1, 1, 4, 4)
+    camera[..., 0, 3] = 10.0
+    camera[..., 2, 3] = -2.0
+    fusion = _small_fusion()
+    backbone = _DirectSSBackbone(fusion.condition_dim)
+    flow = AffostructionSSFlow(
+        backbone,
+        condition_dim=fusion.condition_dim,
+        classifier_free_dropout=0.0,
+    )
+    branch = TrainableVoxelSSBranch(fusion, flow)
+    state = torch.randn(1, 8, 2, 2, 2)
+    fallback = torch.randn(1, 3, fusion.condition_dim)
+    fused, prediction, _ = branch(
+        _geometry_with_nonintersecting_pointmap(),
+        {
+            "masks": torch.ones(1, 1, 1, 2, 2),
+            "c2w_dataset": camera,
+            "canonical_center": torch.zeros(1, 3),
+            "canonical_half_extent": torch.full((1, 3), 0.5),
+        },
+        state,
+        torch.zeros(1),
+        fallback,
+        torch.ones(1, 1, 2, 2, 2),
+    )
+    prediction.velocity.square().mean().backward()
+
+    assert fused.alignment_mode == "base_only_no_canonical_rays"
+    assert not fused.observation_mask.any()
+    assert fused.alignment_plausible_fraction.item() == 0.0
+    torch.testing.assert_close(backbone.seen_condition, fallback)
+    assert all(parameter.grad is not None for parameter in fusion.parameters())
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in fusion.parameters())
+    assert backbone.scale.grad is not None
+    assert torch.count_nonzero(backbone.scale.grad) > 0
+
+
+class _AlignedGeometryWithoutCondition(torch.nn.Module):
+    """Reproduce the former geometry-available/zero-observation contradiction."""
+
+    def __init__(self, condition_dim: int) -> None:
+        super().__init__()
+        self.condition_dim = condition_dim
+        self.projection_weight = torch.nn.Parameter(torch.ones(()))
+
+    def forward(self, geometry, **kwargs):
+        del geometry, kwargs
+        token_count = 4
+        scalar = torch.zeros(1, token_count, 1)
+        observation = torch.zeros(1, token_count, 1, dtype=torch.bool)
+        return VoxelFusionOutput(
+            sparse_tensor=None,
+            dense_tokens=torch.zeros(1, token_count, self.condition_dim),
+            voxel_indices=torch.empty(0, 4, dtype=torch.int32),
+            voxel_xyz=torch.empty(0, 3),
+            voxel_confidence=scalar,
+            observation_mask=observation,
+            accumulated_weight=scalar.clone(),
+            observation_count=scalar.clone(),
+            valid_mask=observation[..., 0],
+            alignment_scale=torch.ones(1),
+            condition_dim=self.condition_dim,
+            alignment_plausible_fraction=torch.ones(1),
+            geometry_available=torch.ones(1, dtype=torch.bool),
+            conditioning_available=torch.zeros(1, dtype=torch.bool),
+        )
+
+
+def test_aligned_but_zero_condition_uses_real_fallback_and_keeps_ddp_graph():
+    fusion = _AlignedGeometryWithoutCondition(condition_dim=5)
+    backbone = _DirectSSBackbone(condition_dim=5)
+    flow = AffostructionSSFlow(
+        backbone,
+        condition_dim=5,
+        classifier_free_dropout=0.0,
+    )
+    branch = TrainableVoxelSSBranch(fusion, flow)
+    state = torch.randn(1, 3, 2, 2, 2)
+    fallback = torch.randn(1, 4, 5)
+    fused, prediction, _ = branch(
+        object(),
+        {
+            "masks": torch.ones(1, 1, 1, 1, 1),
+            "c2w_dataset": torch.eye(4).view(1, 1, 4, 4),
+            "canonical_center": torch.zeros(1, 3),
+            "canonical_half_extent": torch.ones(1, 3),
+        },
+        state,
+        torch.zeros(1),
+        fallback,
+        torch.randn(1, 1, 2, 1, 1),
+    )
+    prediction.velocity.square().mean().backward()
+
+    assert fused.geometry_available.item()
+    assert not fused.conditioning_available.item()
+    torch.testing.assert_close(backbone.seen_condition, fallback)
+    assert all(parameter.grad is not None for parameter in branch.parameters())
+    assert torch.count_nonzero(fusion.projection_weight.grad) == 0
+    assert torch.count_nonzero(backbone.scale.grad) > 0
+
+
+def test_all_invalid_foundation_geometry_is_an_explicit_base_only_state():
+    geometry = _geometry_with_nonintersecting_pointmap()
+    geometry = VGGTGeometryBatch(
+        **{
+            **geometry.__dict__,
+            "depth_valid_mask": torch.zeros(1, 1, 2, 2, dtype=torch.bool),
+            "point_valid_mask": torch.zeros(1, 1, 2, 2, dtype=torch.bool),
+            "camera_valid_mask": torch.zeros(1, 1, dtype=torch.bool),
+        }
+    )
+    fused = _small_fusion()(
+        geometry,
+        foreground_masks=torch.ones(1, 1, 1, 2, 2),
+        dataset_K=torch.eye(3).view(1, 1, 3, 3),
+        dataset_c2w=torch.eye(4).view(1, 1, 4, 4),
+        canonical_center=torch.zeros(1, 3),
+        canonical_half_extent=torch.full((1, 3), 0.5),
+    )
+
+    assert fused.geometry_status == "base_only"
+    assert not fused.geometry_available.any()
+    assert fused.geometry_quality.item() == 0.0
+    assert fused.depth_supervision_weight.sum().item() == 0.0
+
+
+class _NegativeOccupancyDecoder(torch.nn.Module):
+    def forward(self, clean_grid):
+        return clean_grid[:, :1] - 10.0
+
+
+class _NonfiniteOccupancyDecoder(torch.nn.Module):
+    def forward(self, clean_grid):
+        return clean_grid[:, :1] * torch.tensor(float("nan"), device=clean_grid.device)
+
+
+def _minimal_loss_inputs():
+    v_final = torch.zeros(1, 8, 8, requires_grad=True)
+    v_target = torch.ones_like(v_final)
+    v_base = torch.zeros_like(v_final)
+    predicted_clean = torch.zeros(1, 8, 2, 2, 2, requires_grad=True)
+    return {
+        "v_final": v_final,
+        "v_target": v_target,
+        "v_base": v_base,
+        "gate": torch.ones(1, 8, 1),
+        "predicted_clean_grid": predicted_clean,
+        "gt_occ": torch.ones(1, 1, 2, 2, 2),
+    }
+
+
+def test_empty_active_decoder_support_is_a_trainable_prediction_not_an_error():
+    builder = FlowMatchingLossBuilder(
+        use_depth_loss=False,
+        use_silhouette_loss=False,
+        use_prior_preservation=False,
+    )
+    inputs = _minimal_loss_inputs()
+    losses = builder(ss_decoder=_NegativeOccupancyDecoder(), **inputs)
+    losses["loss_total"].backward()
+
+    assert torch.isfinite(losses["loss_total"])
+    assert losses["diagnostics"]["decoder_empty_active"] is True
+    assert losses["loss_occupancy"] > 0
+    assert torch.isfinite(inputs["predicted_clean_grid"].grad).all()
+    assert torch.count_nonzero(inputs["predicted_clean_grid"].grad) > 0
+
+
+def test_nonfinite_decoder_output_disables_only_decoder_losses_without_nan_gradients():
+    builder = FlowMatchingLossBuilder(
+        use_depth_loss=False,
+        use_silhouette_loss=False,
+        use_prior_preservation=False,
+    )
+    inputs = _minimal_loss_inputs()
+    losses = builder(ss_decoder=_NonfiniteOccupancyDecoder(), **inputs)
+    losses["loss_total"].backward()
+
+    assert torch.isfinite(losses["loss_total"])
+    assert losses["diagnostics"]["decoder_numerically_valid"] is False
+    assert losses["loss_occupancy"].item() == 0.0
+    assert torch.isfinite(inputs["v_final"].grad).all()
+    assert inputs["predicted_clean_grid"].grad is None
 
 
 def test_resumed_metrics_csv_keeps_existing_schema(tmp_path: Path):
@@ -189,6 +472,39 @@ def test_weighted_duplicate_voxel_reduction_and_observation_mask():
     assert output.observation_count[0, 0, 0] == 2
 
 
+def test_positive_weak_evidence_remains_observed_below_legacy_absolute_cutoff():
+    fusion = ConfidenceSparseVoxelFusion(
+        input_feature_dim=2,
+        projected_feature_dim=2,
+        positional_frequencies=1,
+        observation_threshold=1e-4,
+        require_spconv=False,
+        use_spconv_refinement=False,
+    )
+    fusion.feature_projection = torch.nn.Identity()
+    fusion.condition_dim = 2 + 3 + 6
+    points = torch.full((1, 1, 3, 1, 1), -0.9)
+    features = torch.tensor([[[[[2.0]], [[4.0]]]]])
+    confidence = torch.full((1, 1, 1, 1), 1e-6)
+    weights = confidence.clone()
+    valid = torch.ones(1, 1, 1, 1, dtype=torch.bool)
+
+    output = fusion._reduce_to_voxels(
+        points,
+        features,
+        confidence,
+        weights,
+        valid,
+        torch.ones(1, 1, dtype=torch.bool),
+        torch.ones(1),
+    )
+
+    assert output.accumulated_weight.max().item() < fusion.observation_threshold
+    assert output.observation_mask.any()
+    assert output.conditioning_available.item()
+    assert output.weak_evidence_only.item()
+
+
 def test_zero_init_and_spatial_gate_invariants():
     adapter = SSFlowAdapter(latent_dim=3, condition_dim=5, hidden_dim=16, num_heads=4, num_blocks=1, trust_region=10.0)
     x = torch.randn(1, 4, 3)
@@ -204,6 +520,31 @@ def test_zero_init_and_spatial_gate_invariants():
     assert torch.equal(unobserved.v_final, base)
     full = adapter(x, cond, torch.zeros(1), observed, confidence, v_base=base)
     assert torch.allclose(full.v_final, base + full.delta_v_geo, atol=1e-6)
+
+
+def test_enabled_adapter_without_observations_is_exact_base_and_backward_safe():
+    adapter = SSFlowAdapter(
+        latent_dim=3,
+        condition_dim=5,
+        hidden_dim=16,
+        num_heads=4,
+        num_blocks=1,
+    )
+    base = torch.randn(1, 4, 3)
+    output = adapter(
+        torch.randn_like(base),
+        torch.randn(1, 4, 5),
+        torch.zeros(1),
+        torch.zeros(1, 4, 1, dtype=torch.bool),
+        torch.zeros(1, 4, 1),
+        v_base=base,
+    )
+
+    assert torch.equal(output.v_final, base)
+    assert output.v_final.requires_grad
+    output.v_final.sum().backward()
+    assert all(parameter.grad is not None for parameter in adapter.parameters())
+    assert all(torch.count_nonzero(parameter.grad) == 0 for parameter in adapter.parameters())
 
 
 def test_trellis_flow_pair_matches_sigma_min_equation():
@@ -254,7 +595,8 @@ def test_production_trainer_has_no_mock_or_random_condition_tokens():
     source = (Path(__file__).parents[1] / "scripts" / "train_stochastic_voxel_ss_flow.py").read_text()
     assert "MockSSFlow" not in source
     assert "random condition" not in source.lower()
-    assert "pipeline.encode_image(first_view)" in source
+    assert "pipeline.encode_image(all_views)" in source
+    assert "views * tokens" in source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA AMP smoke requires a GPU")

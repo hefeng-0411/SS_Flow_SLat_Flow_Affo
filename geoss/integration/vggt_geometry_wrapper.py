@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -31,6 +31,10 @@ class VGGTGeometryBatch:
     image_resolution: Tuple[int, int]
     feature_resolution: Tuple[int, int]
     patch_size: int
+    depth_valid_mask: Optional[torch.Tensor] = None
+    point_valid_mask: Optional[torch.Tensor] = None
+    camera_valid_mask: Optional[torch.Tensor] = None
+    diagnostics: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class VGGTGeometryWrapper(nn.Module):
@@ -68,6 +72,10 @@ class VGGTGeometryWrapper(nn.Module):
             for p in self.model.parameters():
                 p.requires_grad_(False)
         self.eval()
+
+    def clear_cache(self) -> None:
+        """Release per-object frozen predictions after a batch is consumed."""
+        self._cache.clear()
 
     def forward(self, images: torch.Tensor, *, use_cache: bool = False) -> Dict[str, torch.Tensor]:
         """Backward-compatible dictionary API. Production code uses :meth:`extract`."""
@@ -141,31 +149,55 @@ class VGGTGeometryWrapper(nn.Module):
         features = output["vggt_features"]
         if features.ndim != 5:
             raise RuntimeError(f"VGGT spatial feature contract must be [B,V,C,Hf,Wf], got {tuple(features.shape)}")
-        _assert_vggt_camera_bundle(camera["w2c"], camera["c2w"], camera["K"], valid_view_mask)
-        spatial_valid = valid_view_mask[:, :, None, None]
-        geometry_valid = (
-            spatial_valid
-            & torch.isfinite(depth[:, :, 0])
-            & (depth[:, :, 0] > 0)
-            & torch.isfinite(point_map).all(dim=2)
+        camera_valid = _vggt_camera_validity(
+            camera["w2c"], camera["c2w"], camera["K"], valid_view_mask
         )
-        if bool((geometry_valid.flatten(1).sum(dim=1) == 0).any()):
-            raise RuntimeError("VGGT produced no finite positive-depth geometry for at least one object")
+        spatial_valid = valid_view_mask[:, :, None, None]
+        depth_valid = spatial_valid & torch.isfinite(depth[:, :, 0]) & (depth[:, :, 0] > 0)
+        point_valid = spatial_valid & torch.isfinite(point_map).all(dim=2)
+        feature_finite = torch.isfinite(features).all(dim=2)
+
+        # Frozen foundation predictions are evidence, not dataset contracts.
+        # Preserve their validity explicitly and sanitize storage so one bad
+        # head/pixel cannot spread NaNs through interpolation or attention.
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+        point_map = torch.nan_to_num(point_map, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_confidence = torch.nan_to_num(
+            output["vggt_depth_confidence"].float(), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(0, 1)
+        point_confidence = torch.nan_to_num(
+            output["vggt_point_confidence"].float(), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(0, 1)
+        features = torch.nan_to_num(features.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        safe_w2c, safe_c2w, safe_K = _sanitize_vggt_camera_bundle(
+            camera["w2c"], camera["K"], camera_valid
+        )
         return VGGTGeometryBatch(
             # clone outside inference_mode so trainable projections may save
             # these frozen values for their own weight gradients.
             depth=depth.clone(),
-            depth_confidence=output["vggt_depth_confidence"].float().clone(),
+            depth_confidence=depth_confidence.clone(),
             point_map=point_map.clone(),
-            point_confidence=output["vggt_point_confidence"].float().clone(),
-            intrinsics=camera["K"].float().clone(),
-            extrinsics=camera["w2c"].float().clone(),
-            camera_to_world=camera["c2w"].float().clone(),
+            point_confidence=point_confidence.clone(),
+            intrinsics=safe_K.clone(),
+            extrinsics=safe_w2c.clone(),
+            camera_to_world=safe_c2w.clone(),
             visual_features=features.float().clone(),
             valid_view_mask=valid_view_mask.clone(),
             image_resolution=tuple(int(value) for value in depth.shape[-2:]),
             feature_resolution=tuple(int(value) for value in features.shape[-2:]),
             patch_size=int(getattr(getattr(self.model, "aggregator", None), "patch_size", 14)),
+            depth_valid_mask=depth_valid.clone(),
+            point_valid_mask=point_valid.clone(),
+            camera_valid_mask=camera_valid.clone(),
+            diagnostics={
+                "depth_valid_fraction": depth_valid.float().flatten(1).mean(dim=1),
+                "point_valid_fraction": point_valid.float().flatten(1).mean(dim=1),
+                "feature_finite_fraction": feature_finite.float().flatten(1).mean(dim=1),
+                "camera_valid_fraction": (
+                    camera_valid & valid_view_mask
+                ).float().sum(dim=1) / valid_view_mask.float().sum(dim=1).clamp_min(1),
+            },
         )
 
     def _forward_vggt_once(self, images: torch.Tensor):
@@ -308,27 +340,55 @@ class VGGTGeometryWrapper(nn.Module):
         return model, pose_encoding_to_extri_intri
 
 
-def _assert_vggt_camera_bundle(
+def _vggt_camera_validity(
     w2c: torch.Tensor,
     c2w: torch.Tensor,
     intrinsics: torch.Tensor,
     valid_view_mask: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
     if w2c.shape[-2:] != (4, 4) or c2w.shape != w2c.shape or intrinsics.shape[-2:] != (3, 3):
         raise ValueError(
             f"Malformed VGGT cameras: w2c={tuple(w2c.shape)}, c2w={tuple(c2w.shape)}, K={tuple(intrinsics.shape)}"
         )
-    finite = torch.isfinite(w2c).all(dim=(-2, -1)) & torch.isfinite(intrinsics).all(dim=(-2, -1))
-    if not bool(finite[valid_view_mask].all()):
-        raise ValueError("VGGT returned non-finite camera matrices")
+    finite = (
+        torch.isfinite(w2c).all(dim=(-2, -1))
+        & torch.isfinite(c2w).all(dim=(-2, -1))
+        & torch.isfinite(intrinsics).all(dim=(-2, -1))
+    )
     identity = torch.eye(4, device=w2c.device, dtype=w2c.dtype)
-    inverse_error = (w2c @ c2w - identity).abs().amax(dim=(-2, -1))
-    rotation = w2c[..., :3, :3]
+    safe_w2c = torch.nan_to_num(w2c.float())
+    safe_c2w = torch.nan_to_num(c2w.float())
+    inverse_error = (safe_w2c @ safe_c2w - identity.float()).abs().amax(dim=(-2, -1))
+    rotation = safe_w2c[..., :3, :3]
     rotation_error = (rotation.transpose(-1, -2) @ rotation - identity[:3, :3]).abs().amax(dim=(-2, -1))
-    if bool((inverse_error[valid_view_mask] > 2e-3).any()) or bool((rotation_error[valid_view_mask] > 2e-3).any()):
-        raise ValueError("VGGT camera inversion/rotation assertions failed")
-    if bool((intrinsics[..., 0, 0][valid_view_mask] <= 0).any()) or bool((intrinsics[..., 1, 1][valid_view_mask] <= 0).any()):
-        raise ValueError("VGGT intrinsics contain non-positive focal lengths")
+    positive_focal = (intrinsics[..., 0, 0] > 0) & (intrinsics[..., 1, 1] > 0)
+    return (
+        valid_view_mask
+        & finite
+        & (inverse_error <= 2e-3)
+        & (rotation_error <= 2e-3)
+        & positive_focal
+    )
+
+
+def _sanitize_vggt_camera_bundle(
+    w2c: torch.Tensor,
+    intrinsics: torch.Tensor,
+    valid: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replace unusable predicted cameras while retaining a validity mask."""
+    B, V = valid.shape
+    identity4 = torch.eye(4, device=w2c.device, dtype=torch.float32).view(1, 1, 4, 4)
+    identity3 = torch.eye(3, device=w2c.device, dtype=torch.float32).view(1, 1, 3, 3)
+    safe_w2c = torch.where(
+        valid[:, :, None, None], torch.nan_to_num(w2c.float()), identity4.expand(B, V, -1, -1)
+    )
+    safe_K = torch.where(
+        valid[:, :, None, None],
+        torch.nan_to_num(intrinsics.float()),
+        identity3.expand(B, V, -1, -1),
+    )
+    return safe_w2c, torch.linalg.inv(safe_w2c), safe_K
 
 
 def _to_b_n_1_h_w(depth: torch.Tensor, B: int, N: int) -> torch.Tensor:

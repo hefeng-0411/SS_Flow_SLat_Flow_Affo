@@ -16,7 +16,6 @@ from typing import Any, Dict, Optional, Sequence
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import get_worker_info
 
 from geoss.datasets.meshfleet_trellis_dataset import (
     MeshFleetTrellisDataset,
@@ -30,9 +29,9 @@ from geoss.utils.coordinates import c2w_to_w2c, parse_objaverse_camera
 class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
     """MeshFleet dataset with deterministic stochastic ``N in [1, 8]`` views.
 
-    A sample's random stream is a stable function of seed, epoch, rank, worker,
-    index and UID.  Calling :meth:`set_epoch` therefore changes the view set
-    without relying on process-global Python or NumPy RNG state.
+    A sample's random stream is a stable function of seed, epoch, rank, index
+    and UID. Worker identity is deliberately excluded: scheduling/prefetch and
+    worker-count changes must not alter the scientific sample definition.
     """
 
     def __init__(
@@ -49,6 +48,8 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         load_gt_occupancy: bool = True,
         occupancy_resolution: int = 64,
         meshfleet_root: Optional[str] = None,
+        depth_root: Optional[str] = None,
+        require_depth: bool = False,
         **kwargs: Any,
     ) -> None:
         if min_views < 1 or max_views < min_views or max_views > 8:
@@ -61,6 +62,10 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         self.use_stochastic_views = bool(use_stochastic_views)
         self.load_gt_occupancy = bool(load_gt_occupancy)
         self.occupancy_resolution = int(occupancy_resolution)
+        self.depth_root = Path(depth_root) if depth_root is not None else None
+        self.require_depth = bool(require_depth)
+        if self.require_depth and self.depth_root is None:
+            raise ValueError("require_depth=True requires depth_root")
         super().__init__(
             root=root,
             split=split,
@@ -128,7 +133,7 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         selected_positions = torch.randperm(len(available), generator=generator)[:count].tolist()
         chosen = [available[position] for position in selected_positions]
 
-        images, masks, intrinsics, c2w = [], [], [], []
+        images, masks, depths, intrinsics, c2w = [], [], [], [], []
         for record in chosen:  # one bounded loop over at most eight external image files
             frame, image_path = record.frame, record.image_path
             with Image.open(image_path) as handle:
@@ -144,6 +149,32 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
             _assert_camera(camera_to_world, intrinsic, sample["uid"])
             images.append(rgb)
             masks.append(mask)
+            if self.depth_root is not None:
+                depth_path = self.depth_root / self.split / sample["uid"] / f"{record.frame_id}.npz"
+                if not depth_path.is_file():
+                    if self.require_depth:
+                        raise FileNotFoundError(
+                            f"Missing Affostruction metric depth for exact frame {record.frame_id}: {depth_path}"
+                        )
+                else:
+                    with np.load(depth_path, allow_pickle=False) as depth_archive:
+                        encoded = np.asarray(depth_archive["depth_u16"], dtype=np.uint16)
+                        depth_min = float(depth_archive["depth_min"])
+                        depth_max = float(depth_archive["depth_max"])
+                    depth = np.zeros(encoded.shape, dtype=np.float32)
+                    foreground = encoded > 0
+                    if foreground.any():
+                        depth[foreground] = depth_min + (
+                            (encoded[foreground].astype(np.float32) - 1.0) / 65534.0
+                        ) * (depth_max - depth_min)
+                    if depth.shape != (self.image_size, self.image_size):
+                        raise ValueError(
+                            f"Depth/image resolution mismatch for {depth_path}: {depth.shape} != "
+                            f"{(self.image_size, self.image_size)}"
+                        )
+                    if not np.isfinite(depth).all() or np.any(depth < 0):
+                        raise ValueError(f"Invalid metric depth values in {depth_path}")
+                    depths.append(torch.from_numpy(depth.astype(np.float32, copy=False)))
             intrinsics.append(intrinsic)
             c2w.append(camera_to_world)
         if not all(record.numeric_id is not None for record in chosen):
@@ -196,6 +227,14 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
                 "rank": self.rank,
             },
         }
+        if self.depth_root is not None and len(depths) == len(chosen):
+            result["depths"] = torch.stack(depths)
+            result["metadata"]["depth_source"] = "mesh_rasterized_metric_depth"
+            result["metadata"]["depth_frame_ids"] = [record.frame_id for record in chosen]
+        elif self.require_depth:
+            raise RuntimeError(
+                f"Depth population is incomplete for uid={sample['uid']}: {len(depths)}/{len(chosen)}"
+            )
         self._attach_structure_targets(result, sample)
         return result
 
@@ -228,9 +267,7 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
             result["gt_sparse_indices"] = indices
 
     def _sample_seed(self, index: int, uid: str) -> int:
-        worker = get_worker_info()
-        worker_id = 0 if worker is None else int(worker.id)
-        payload = f"{self.seed}|{self.epoch}|{self.rank}|{worker_id}|{index}|{uid}".encode("utf-8")
+        payload = f"{self.seed}|{self.epoch}|{self.rank}|{index}|{uid}".encode("utf-8")
         return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") & 0x7FFF_FFFF_FFFF_FFFF
 
 
@@ -248,6 +285,11 @@ def stochastic_meshfleet_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str,
     valid = torch.zeros(batch_size, max_views, dtype=torch.bool)
     view_ids = torch.full((batch_size, max_views), -1, dtype=torch.long)
     view_metadata_indices = torch.full((batch_size, max_views), -1, dtype=torch.long)
+    depths = None
+    if all("depths" in sample for sample in samples):
+        depths = samples[0]["depths"].new_zeros(
+            (batch_size, max_views, *samples[0]["depths"].shape[-2:])
+        )
     for batch_index, sample in enumerate(samples):  # bounded batch metadata loop
         count = int(sample["num_views"])
         images[batch_index, :count] = sample["images"]
@@ -257,6 +299,8 @@ def stochastic_meshfleet_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str,
         valid[batch_index, :count] = True
         view_ids[batch_index, :count] = sample["view_ids"]
         view_metadata_indices[batch_index, :count] = sample["view_metadata_indices"]
+        if depths is not None:
+            depths[batch_index, :count] = sample["depths"]
     result: Dict[str, Any] = {
         "uid": [sample["uid"] for sample in samples],
         "images": images,
@@ -275,6 +319,8 @@ def stochastic_meshfleet_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str,
         "object_offset": torch.stack([sample["object_offset"] for sample in samples]),
         "metadata": [sample["metadata"] for sample in samples],
     }
+    if depths is not None:
+        result["depths"] = depths
     for key in ("ss_latent_grid", "ss_latent_tokens", "gt_occ"):
         if all(key in sample for sample in samples):
             result[key] = torch.stack([sample[key] for sample in samples])

@@ -1,7 +1,7 @@
 use_real_vggt: true
 use_real_trellis: true
-use_decoder: false
-use_render_loss: false
+use_decoder: true
+use_render_loss: true
 allow_mock: false
 allow_synthetic: false
 alignment_enabled: true
@@ -11,29 +11,46 @@ confidence_calibration: true
 trust_region: true
 render_eval: false
 real_train: true
-ablation_mode: slat_adapter_only
+ablation_mode: vggt_affostruction_sparse_residual_slat_flow
 device: cuda
-output_dir: outputs/real_train_slat
+amp: true
+amp_dtype: fp16
+fused_optimizer: true
+max_grad_norm: 1.0
+gradient_checkpointing: true
+batch_size: 1
+num_workers: 8
+pin_memory: true
+prefetch_factor: 4
+output_dir: outputs/affostruction_slat_fp32
 steps: 1000
 steps_are_total: true
 minimum_dataset_passes: 1.0
+lr: 0.00001
+conditioner_lr: 0.0001
+weight_decay: 0.0
+adam_epsilon: 0.00000001
+warmup_steps: 100
+min_learning_rate_ratio: 0.1
+archive_every: 0
 adaptive_batch:
   enabled: true
   min_batch_size: 1
-  max_batch_size: 16
-  target_utilization: 0.92
-  low_utilization: 0.82
-  hard_utilization: 0.97
-  grow_patience_steps: 8
-  cooldown_steps: 3
+  max_batch_size: 8
+  target_utilization: 0.94
+  low_utilization: 0.84
+  hard_utilization: 0.98
+  grow_patience_steps: 4
+  cooldown_steps: 5
   grow_factor: 1.25
   reduce_factor: 0.5
 early_stop: true
-early_stop_metric: loss
+early_stop_metric: loss_slat_flow
 early_stop_mode: min
 trellis:
   root: /mnt/sda/hf/MVG/Base/TRELLIS
   pipeline: microsoft/TRELLIS-image-large
+  hf_cache_root: /mnt/sda/hf/.cache/huggingface/hub
   torch_hub_dir: /mnt/sda/hf/.cache/torch/hub
   dinov2_repo: /mnt/sda/hf/.cache/torch/hub/facebookresearch_dinov2_main
 dataset:
@@ -43,7 +60,7 @@ dataset:
   category: null
   num_views: 8
   image_size: 128
-  train_manifest: outputs/forensics_20260801/dataset_audit/stage3_train_uids.json
+  train_manifest: outputs/affostruction_dataset_audit/stage3_train_uids.json
 dependencies:
   require_gsplat_for_real_eval: false
   require_pycolmap_for_pose_check: false
@@ -53,7 +70,7 @@ dependencies:
   require_kaolin_for_voxel_ops: false
 rendering:
   renderer: gsplat
-  enable_render_loss: false
+  enable_render_loss: true
   enable_mask_loss: true
   enable_depth_loss: true
   enable_lpips_loss: false
@@ -77,9 +94,31 @@ evaluation:
 model:
   resolution: 64
   slat_dim: 8
-  evidence_dim: 128
-  hidden_dim: 256
-  feature_dim: 16
+  low_feature_dim: 64
+  depth_temperature: 0.04
+  occlusion_margin: 0.03
+  minimum_incidence: 0.05
+  classifier_free_dropout: 0.1
+  residual_limit: 1.0
+loss:
+  endpoint_weight: 0.25
+  prior_weight: 0.01
+affostruction:
+  root: /mnt/sda/hf/MVG/Base/Affostruction
+decoded_supervision:
+  enabled: true
+  every: 4
+  views_per_object: 2
+  rgb_weight: 1.0
+  mask_weight: 0.5
+  depth_weight: 0.1
+  feature_weight: 0.25
+  cross_view_rgb_weight: 0.25
+  geometry_weight: 0.1
+  geometry_points: 2048
+  feature_grid_size: 12
+  sinkhorn_blur: 0.02
+  extensions_root: /mnt/sda/hf/MVG/Base/extensions
 vggt:
   root: /mnt/sda/hf/MVG/Base/vggt
   pretrained: facebook/VGGT-1B

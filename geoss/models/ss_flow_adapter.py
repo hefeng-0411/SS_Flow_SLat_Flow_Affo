@@ -1,14 +1,152 @@
-"""3-D-aligned residual velocity adapter for frozen TRELLIS SS Flow."""
+"""Geometry-conditioned TRELLIS SS flow modules."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+import inspect
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+from geoss.models.affostruction_conditioning import (
+    compact_condition_tokens,
+    enable_trellis_gradient_checkpointing,
+)
+
+
+@dataclass(frozen=True)
+class AffostructionSSFlowOutput:
+    """Direct full-backbone SS velocity and its voxel condition contract."""
+
+    velocity: torch.Tensor
+    condition: torch.Tensor
+    condition_valid: torch.Tensor
+    diagnostics: Dict[str, torch.Tensor]
+
+
+class AffostructionSSFlow(nn.Module):
+    """Fine-tune the complete TRELLIS SS denoiser on fused voxel conditions.
+
+    This is the propagation graph used by the released Affostruction
+    reconstruction model: the fused 1024-D voxel tokens are the native
+    cross-attention context of every TRELLIS transformer block.  There is no
+    parallel frozen prediction, residual velocity head, trust-region clamp, or
+    post-hoc gate in this path.
+    """
+
+    architecture_version = "affostruction_direct_ss_cross_attention_v1"
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        *,
+        condition_dim: int = 1024,
+        classifier_free_dropout: float = 0.1,
+        gradient_checkpointing: bool = True,
+    ) -> None:
+        super().__init__()
+        if not 0.0 <= float(classifier_free_dropout) < 1.0:
+            raise ValueError("classifier_free_dropout must lie in [0,1)")
+        backbone_condition_dim = int(getattr(backbone, "cond_channels", -1))
+        if backbone_condition_dim != int(condition_dim):
+            raise ValueError(
+                f"TRELLIS SS cond_channels={backbone_condition_dim}, expected {condition_dim}"
+            )
+        self.backbone = backbone.train().requires_grad_(True)
+        self.condition_dim = int(condition_dim)
+        self.classifier_free_dropout = float(classifier_free_dropout)
+        self.accepts_condition_mask = "cond_mask" in inspect.signature(backbone.forward).parameters
+        enable_trellis_gradient_checkpointing(self.backbone, gradient_checkpointing)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        voxel_condition: torch.Tensor,
+        observation_mask: torch.Tensor,
+        *,
+        fallback_condition: Optional[torch.Tensor] = None,
+    ) -> AffostructionSSFlowOutput:
+        if x_t.ndim != 5:
+            raise ValueError(f"x_t must be [B,C,D,H,W], got {tuple(x_t.shape)}")
+        if voxel_condition.ndim != 3 or voxel_condition.shape[-1] != self.condition_dim:
+            raise ValueError(
+                f"voxel_condition must be [B,M,{self.condition_dim}], got {tuple(voxel_condition.shape)}"
+            )
+        compact = compact_condition_tokens(voxel_condition, observation_mask)
+        batch_size = x_t.shape[0]
+        if compact.tokens.shape[0] != batch_size:
+            raise ValueError("voxel condition and SS state batch sizes differ")
+
+        has_geometry = compact.counts > 0
+        if bool((~has_geometry).any()):
+            if fallback_condition is None:
+                raise RuntimeError("An SS sample without aligned voxel evidence requires real DINO fallback tokens")
+            if fallback_condition.ndim != 3 or fallback_condition.shape[0] != batch_size:
+                raise ValueError(
+                    f"fallback_condition must be [B,T,C], got {tuple(fallback_condition.shape)}"
+                )
+            if fallback_condition.shape[-1] != self.condition_dim:
+                raise ValueError(
+                    f"fallback condition width {fallback_condition.shape[-1]} != {self.condition_dim}"
+                )
+
+        condition = compact.tokens
+        condition_valid = compact.valid_mask
+        if bool(has_geometry.all()):
+            if not self.accepts_condition_mask:
+                if batch_size != 1 and not bool((compact.counts == compact.counts[0]).all()):
+                    raise RuntimeError(
+                        "Native TRELLIS lacks a condition mask; unequal compact voxel counts require per-rank batch size 1"
+                    )
+                condition = condition[:, : int(compact.counts.min().item())]
+                condition_valid = torch.ones(
+                    condition.shape[:2], device=condition.device, dtype=torch.bool
+                )
+        elif batch_size == 1:
+            condition = fallback_condition
+            condition_valid = torch.ones(
+                condition.shape[:2], device=condition.device, dtype=torch.bool
+            )
+        else:
+            raise RuntimeError(
+                "Mixed geometry/fallback SS batches require a mask-aware Affostruction backbone"
+            )
+
+        dropped = torch.zeros(batch_size, device=x_t.device, dtype=torch.bool)
+        if self.training and self.classifier_free_dropout > 0.0:
+            dropped = torch.rand(batch_size, device=x_t.device) < self.classifier_free_dropout
+            condition = torch.where(
+                dropped[:, None, None], torch.zeros_like(condition), condition
+            )
+
+        if self.accepts_condition_mask:
+            velocity = self.backbone(x_t, timestep, condition, cond_mask=condition_valid)
+        else:
+            velocity = self.backbone(x_t, timestep, condition)
+        if velocity.shape != x_t.shape:
+            raise RuntimeError(
+                f"TRELLIS SS velocity shape {tuple(velocity.shape)} != state {tuple(x_t.shape)}"
+            )
+        finite = torch.isfinite(velocity).flatten(1).all(dim=1)
+        return AffostructionSSFlowOutput(
+            velocity=velocity,
+            condition=condition,
+            condition_valid=condition_valid,
+            diagnostics={
+                "conditioning_voxel_count": compact.counts.float().mean(),
+                "conditioning_token_count": velocity.new_tensor(float(condition.shape[1])),
+                "geometry_condition_fraction": has_geometry.float().mean(),
+                "classifier_free_dropout_fraction": dropped.float().mean(),
+                "velocity_finite_fraction": finite.float().mean(),
+                "percentage_observed": observation_mask.float().mean() * 100.0,
+                "mean_adapter_norm": velocity.float().norm(dim=1).mean(),
+                "residual_base_ratio": velocity.new_zeros(()),
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -126,8 +264,13 @@ class SSFlowAdapter(nn.Module):
             if self.g_unobserved == 0.0:
                 zero = torch.zeros_like(v_base)
                 zero_gate = torch.zeros(B, L, 1, device=v_base.device, dtype=v_base.dtype)
+                # Base-only is a valid semantic result, but during training it
+                # must still be a valid autograd result.  Attach an exactly-zero
+                # dependency to every adapter parameter so DDP sees a complete,
+                # synchronized graph even when this rank has no condition voxels.
+                graph_zero = _parameter_graph_zero(self, v_base)
                 return SSFlowAdapterOutput(
-                    v_base,
+                    v_base + graph_zero,
                     zero,
                     zero_gate,
                     zero_gate[:, :1],
@@ -214,6 +357,15 @@ def _as_gate_tensor(value: torch.Tensor, B: int, L: int, name: str) -> torch.Ten
     return value
 
 
+def _parameter_graph_zero(module: nn.Module, reference: torch.Tensor) -> torch.Tensor:
+    """Return a scalar zero connected to every trainable parameter in ``module``."""
+    graph_zero = reference.new_zeros(())
+    for parameter in module.parameters():
+        if parameter.requires_grad and parameter.numel() > 0:
+            graph_zero = graph_zero + parameter.reshape(-1)[0] * 0.0
+    return graph_zero
+
+
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask_float = mask.to(dtype=value.dtype)
     return (value * mask_float).sum() / mask_float.sum().clamp_min(1)
@@ -239,4 +391,10 @@ def _diagnostics(
     }
 
 
-__all__ = ["SSFlowAdapter", "SSFlowAdapterOutput", "normalize_trellis_timestep"]
+__all__ = [
+    "AffostructionSSFlow",
+    "AffostructionSSFlowOutput",
+    "SSFlowAdapter",
+    "SSFlowAdapterOutput",
+    "normalize_trellis_timestep",
+]

@@ -15,7 +15,7 @@ class BatchAdjustment:
     new_batch_size: int
     reason: str
     vram_utilization: float | None
-    peak_reserved_gb: float | None
+    peak_allocated_gb: float | None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -24,7 +24,7 @@ class BatchAdjustment:
             "new_batch_size": self.new_batch_size,
             "reason": self.reason,
             "vram_utilization": self.vram_utilization,
-            "peak_reserved_gb": self.peak_reserved_gb,
+            "peak_allocated_gb": self.peak_allocated_gb,
         }
 
 
@@ -104,6 +104,19 @@ class AdaptiveBatchController:
             _reset_peak_stats(device)
             return self._last_adjustment
 
+        if util >= self.hard_utilization and self.batch_size > self.min_batch_size:
+            old = self.batch_size
+            self._unsafe_batch_size = old if self._unsafe_batch_size is None else min(self._unsafe_batch_size, old)
+            self._safe_batch_size = min(self._safe_batch_size, old - 1)
+            self.batch_size = max(self.min_batch_size, old - 1)
+            self._low_vram_steps = 0
+            self._cooldown_remaining = self.cooldown_steps
+            self._last_adjustment = BatchAdjustment(
+                True, old, self.batch_size, "shrink_hard_vram", util, peak_gb
+            )
+            _reset_peak_stats(device)
+            return self._last_adjustment
+
         if util < self.low_utilization and self.batch_size < self.max_batch_size:
             self._low_vram_steps += 1
         else:
@@ -113,12 +126,12 @@ class AdaptiveBatchController:
             old = self.batch_size
             self._safe_batch_size = max(self._safe_batch_size, old)
             high = self.unsafe_or_max()
-            if high > old + 1:
+            if self._unsafe_batch_size is not None and high > old + 1:
                 proposed = (old + high) // 2
                 reason = "binary_probe_low_vram"
             else:
-                proposed = max(old + 1, int(math.ceil(old * self.grow_factor)))
-                reason = "grow_low_vram"
+                proposed = old + 1
+                reason = "sequential_probe_low_vram"
             self.batch_size = min(self.max_batch_size, proposed)
             self._low_vram_steps = 0
             self._cooldown_remaining = self.cooldown_steps
@@ -208,9 +221,10 @@ def cuda_vram_stats(device: torch.device) -> tuple[float, float]:
     free, total = torch.cuda.mem_get_info(index)
     used_by_driver = max(0, total - free)
     reserved = torch.cuda.memory_reserved(index)
-    peak_reserved = torch.cuda.max_memory_reserved(index)
-    used = max(used_by_driver, reserved, peak_reserved)
-    return float(used / max(1, total)), float(peak_reserved / (1024 ** 3))
+    peak_allocated = torch.cuda.max_memory_allocated(index)
+    externally_used = max(0, used_by_driver - reserved)
+    effective_peak = min(total, externally_used + peak_allocated)
+    return float(effective_peak / max(1, total)), float(peak_allocated / (1024 ** 3))
 
 
 def _sync_max_float(value: float, device: torch.device) -> float:

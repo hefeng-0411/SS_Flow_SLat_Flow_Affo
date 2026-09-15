@@ -39,7 +39,10 @@ def save_npz(path: str | Path, **arrays) -> None:
     serializable = {}
     for key, value in arrays.items():
         if isinstance(value, torch.Tensor):
-            serializable[key] = value.detach().cpu().numpy()
+            tensor = value.detach().cpu()
+            if tensor.dtype == torch.bfloat16:
+                tensor = tensor.float()
+            serializable[key] = tensor.numpy()
         else:
             serializable[key] = value
     np.savez_compressed(path, **serializable)

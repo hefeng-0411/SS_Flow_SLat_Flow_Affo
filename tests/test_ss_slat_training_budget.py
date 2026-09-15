@@ -206,10 +206,12 @@ def test_active_tokens_zero_keeps_every_active_voxel() -> None:
     assert valid[1].sum().item() == 3
 
 
-def test_slat_trainer_records_teacher_support_and_absent_ss_connection() -> None:
+def test_slat_trainer_records_support_boundary_and_frozen_backbone_propagation() -> None:
     source = (ROOT / "scripts" / "train_geovis_slat.py").read_text(encoding="utf-8")
-    assert '"coordinate_source": "cached_trellis_slat_teacher"' in source
-    assert '"upstream_ss_checkpoint": None' in source
+    assert '"coordinate_source": "cached_trellis_slat_ground_truth_support"' in source
+    assert '"support_schedule": "ground_truth_ss_support_teacher_forcing_train_predicted_ss_support_inference"' in source
+    assert '"cross_stage_gradient": "independent_sparse_image_flow_and_conditioner_only"' in source
+    assert '"upstream_ss_checkpoint": cfg.get("upstream_ss_checkpoint")' in source
     assert '"train_inference_support_match": False' in source
     assert '"vggt_root": cfg.get("vggt_root") or vggt.get("root")' in source
 

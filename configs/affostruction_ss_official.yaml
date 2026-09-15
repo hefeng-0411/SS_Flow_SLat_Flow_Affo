@@ -1,0 +1,55 @@
+infrastructure:
+  affostruction_root: /mnt/sda/hf/MVG/Base/Affostruction
+  trellis_root: /mnt/sda/hf/MVG/Base/TRELLIS
+  dinov2_repo: /mnt/sda/hf/.cache/torch/hub/facebookresearch_dinov2_main
+  torch_hub_dir: /mnt/sda/hf/.cache/torch/hub
+  meshfleet_root: /mnt/sda/hf/MVG/Base/MeshFleet
+  dataset_root: /mnt/sda/hf/MVG/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97
+  depth_root: /mnt/sda/hf/MVG/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97/affostruction_depth
+  output_dir: outputs/affostruction_ss_official
+  initial_checkpoint: null
+
+dataset:
+  train_split: train
+  validation_split: test
+  min_views: 1
+  max_views: 8
+  batch_size: 8
+  num_workers: 8
+  prefetch_factor: 4
+
+model:
+  gradient_checkpointing: true
+  precision: fp16
+  fused_optimizer: true
+
+adaptive_batch:
+  adaptive_batch: true
+  adaptive_min_batch_size: 1
+  adaptive_max_batch_size: 16
+  adaptive_target_utilization: 0.94
+  adaptive_low_utilization: 0.84
+  adaptive_hard_utilization: 0.98
+  adaptive_grow_patience_steps: 4
+  adaptive_cooldown_steps: 5
+  adaptive_grow_factor: 1.25
+  adaptive_reduce_factor: 0.5
+
+optimization:
+  seed: 42
+  max_steps: 450000
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  adam_epsilon: 0.00000001
+  ema_rate: 0.9999
+  gradient_clip_norm: 1.0
+  classifier_free_dropout: 0.1
+  sigma_min: 0.00001
+  timestep_logit_mean: 1.0
+  timestep_logit_std: 1.0
+
+logging:
+  validate_every: 1000
+  validation_batches: 8
+  save_every: 1000
+  log_every: 10
